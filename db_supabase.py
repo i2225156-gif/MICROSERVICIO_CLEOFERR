@@ -50,11 +50,10 @@ engine_tienda = _crear_engine("DATABASE_URI_TIENDA")
 
 class _CompatConnection:
     """Envuelve una conexión DBAPI de psycopg2 para ofrecer la misma interfaz
-    que usaba db2.py (estilo mysql.connector): ``cursor(dictionary=True)``,
-    ``commit``, ``rollback`` y ``close``.
+    que usaba db2.py: ``cursor(dictionary=True)``, ``commit``, ``rollback`` y ``close``.
 
-    NOTA: los placeholders ``%s`` son válidos también en psycopg2, así que las
-    consultas parametrizadas existentes siguen funcionando tal cual.
+    NOTA: los placeholders ``%s`` son válidos en psycopg2, así que las
+    consultas parametrizadas existentes funcionan correctamente.
     """
 
     def __init__(self, raw):
