@@ -3,3 +3,4 @@ flask-bcrypt
 psycopg2-binary
 sqlalchemy
 python-dotenv
+PyJWT
