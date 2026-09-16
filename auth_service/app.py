@@ -5,6 +5,7 @@ from flask_bcrypt import Bcrypt
 from functools import wraps
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
+from sqlalchemy import text
 import jwt as pyjwt
 
 load_dotenv()
@@ -77,7 +78,6 @@ def login():
     if request.method == "POST":
         correo = request.form["correo"]
         clave = request.form["clave"]
-        from sqlalchemy import text
         conn = engine_auth.connect()
         cursor = conn.execute(text(
             "SELECT u.id_usuario, u.email, u.contrasena, r.nombre AS rol "
@@ -131,7 +131,6 @@ def login_cliente():
     if request.method == "POST":
         correo = request.form["correo"]
         contrasena = request.form["contrasena"]
-        from sqlalchemy import text
         conn = engine_auth.connect()
         cursor = conn.execute(text("SELECT id_usuario, email, contrasena FROM usuario WHERE email = :e"), {"e": correo.lower()})
         usuario = cursor.mappings().fetchone()
@@ -288,7 +287,6 @@ def nuevo_cliente():
                 "error": "La contraseña es obligatoria para el registro web.",
             }), 400
         hash_pw = Bcrypt.generate_password_hash(contrasena).decode("utf-8")
-        from sqlalchemy import text
         conn = engine_auth.connect()
         try:
             conn.execute(text("INSERT INTO cliente (nombre, email, telefono, direccion, contrasena, activo) VALUES (%s, %s, %s, %s, %s, TRUE)"), (nombre, email, telefono or None, direccion or None, hash_pw))
@@ -310,7 +308,6 @@ def editar_cliente(id):
         email = request.form["email"]
         telefono = request.form.get("telefono", "")
         direccion = request.form.get("direccion", "")
-        from sqlalchemy import text
         conn = engine_auth.connect()
         try:
             conn.execute(text("UPDATE cliente SET nombre = %s, email = %s, telefono = %s, direccion = %s WHERE id_cliente = %s"), (nombre, email, telefono or None, direccion or None, id))
@@ -327,7 +324,6 @@ def editar_cliente(id):
 
 @app.route("/clientes/eliminar/<int:id>")
 def eliminar_cliente(id):
-    from sqlalchemy import text
     conn = engine_auth.connect()
     try:
         conn.execute(text("DELETE FROM cliente WHERE id_cliente = %s"), (id,))
