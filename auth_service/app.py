@@ -14,9 +14,9 @@ load_dotenv()
 
 # Configuración básica
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY")
+app.secret_key = os.environ.get("JWT_SECRET_KEY") or os.environ.get("SECRET_KEY")
 if not app.secret_key:
-    raise RuntimeError("SECRET_KEY no definida. Créla en el archivo .env.")
+    raise RuntimeError("JWT_SECRET_KEY o SECRET_KEY no definida. Créala en el archivo .env.")
 
 app.config["SESSION_TYPE"] = "null"
 bcrypt = Bcrypt(app)
@@ -26,7 +26,7 @@ engine_auth = crear_engine_auth()
 
 from shared.utils import verificar_jwt, extract_token_from_header, extract_token_from_cookie
 
-SECRET_KEY_JWT = os.environ.get("SECRET_KEY")
+SECRET_KEY_JWT = os.environ.get("JWT_SECRET_KEY") or os.environ.get("SECRET_KEY")
 
 
 def generar_token_jwt(usuario_id, correo, rol):

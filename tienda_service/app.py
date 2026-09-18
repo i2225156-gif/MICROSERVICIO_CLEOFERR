@@ -13,9 +13,9 @@ load_dotenv()
 
 # Configuración básica
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY")
+app.secret_key = os.environ.get("JWT_SECRET_KEY") or os.environ.get("SECRET_KEY")
 if not app.secret_key:
-    raise RuntimeError("SECRET_KEY no definida. Créla en el archivo .env.")
+    raise RuntimeError("JWT_SECRET_KEY o SECRET_KEY no definida. Créala en el archivo .env.")
 
 app.config["SESSION_TYPE"] = "null"  # No usar sesiones Flask; usaremos JWT
 
@@ -29,7 +29,7 @@ engine_tienda = crear_engine_tienda()
 from shared.utils import verificar_jwt, extract_token_from_header
 
 # Configuración de JWT para este servicio
-SECRET_KEY_JWT = os.environ.get("SECRET_KEY")
+SECRET_KEY_JWT = os.environ.get("JWT_SECRET_KEY") or os.environ.get("SECRET_KEY")
 
 # Decorador @requiere_jwt para tienda_service
 def requiere_jwt(f):
