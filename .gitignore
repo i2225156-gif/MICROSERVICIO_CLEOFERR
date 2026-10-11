@@ -1,11 +1,22 @@
-# Secretos — nunca versionar
-.env
-
-# Entorno virtual y cache de Python
-venv/
-.venv/
+# Python
 __pycache__/
 *.pyc
-
-# Base de datos SQLite local (fallback desarrollo)
-*.db
+*.pyo
+*.pyd
+# Virtual Environments
+venv/
+.env
+.venv/
+# Alembic
+migrations_auth/versions/*.pyc
+migrations_tienda/versions/*.pyc
+# IDE
+.vscode/
+.idea/
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+# PyInstaller
+*.manifest
+*.spec

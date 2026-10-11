@@ -75,6 +75,7 @@
 <div class="card card-custom" style="max-width:700px">
     <div class="card-body p-4">
         <form method="POST" id="formCliente" novalidate>
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 
             <!-- ── Bloque consulta DNI / RUC ── -->
             <div class="consulta-card">
@@ -195,7 +196,8 @@
 </div>
 
 <script>
-const TOKEN   = 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6ImkyNTEzNzAyQGNvbnRpbmVudGFsLmVkdS5wZSJ9.o02LSzKdddnW-h9XO-sf5hFbquw5vroU6ZAoFhbl9mY';
+/* const TOKEN = 'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6ImkyNTEzNzAyQGNvbnRpbmVudGFsLmVkdS5wZSJ9.o02LSzKdddnW-h9XO-sf5hFbquw5vroU6ZAoFhbl9mY';  -- TOKEN EXPUESTO: mover a variable de entorno/backend. Comentado por seguridad. */
+const TOKEN = ''; // TODO: inyectar desde backend
 const BASE    = 'https://dniruc.apisperu.com/api/v1';
 const soloLetras = /^[a-zA-ZáéíóúÁÉÍÓÚñÑüÜ\s]+$/;
 let tipoActual = 'dni';

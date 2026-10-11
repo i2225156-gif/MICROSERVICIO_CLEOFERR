@@ -1,46 +1,76 @@
+# Test E2E de microservicios Cleoferr (navegador simulado via cookies)
+# Ejecutar: python test_e2e.py  (requiere auth_service:5001 y tienda_service:5002 corriendo)
 import requests
 
-print('=== Prueba 1: POST form-urlencoded login ===')
-r = requests.post('http://127.0.0.1:5001/login', data={
-    'correo': 'admin@cleoferr.com', 
-    'clave': 'Admin123!'
-})
-print(f'Status: {r.status_code}')
-print(f'Headers: {dict(r.headers)}')
-print(f'Body: {r.text[:200]}')
-set_cookie = r.headers.get('Set-Cookie', 'NOT FOUND')
-print(f'Set-Cookie: {set_cookie[:100] if set_cookie != "NOT FOUND" else "NOT FOUND"}')
+AUTH = "http://127.0.0.1:5001"
+TIENDA = "http://127.0.0.1:5002"
 
-print()
-print('=== Prueba 2: POST login with Accept JSON ===')
-r2 = requests.post('http://127.0.0.1:5001/login', data={
-    'correo': 'admin@cleoferr.com', 
-    'clave': 'Admin123!'
-}, headers={'Accept': 'application/json'})
-print(f'Status: {r2.status_code}')
-print(f'Headers: {dict(r2.headers)}')
-print(f'Body: {r2.text[:200]}')
+resultados = []
 
-print()
-print('=== Prueba 3: GET /catalogo with cookie from login ===')
-# Get the cookie from the first login
-jwt_token = r.cookies.get('jwt_token')
-print(f'jwt_token from login: {jwt_token[:20] if jwt_token else "None"}')
-if jwt_token:
-    r3 = requests.get('http://127.0.0.1:5002/catalogo', cookies={'jwt_token': jwt_token})
-    print(f'Status: {r3.status_code}')
-    print(f'Body: {r3.text[:200]}')
+def check(nombre, ok, detalle=""):
+    resultados.append((nombre, ok, detalle))
+    print(f"  [{'OK' if ok else 'FAIL'}] {nombre} {detalle}")
+
+def es_html(r):
+    return "text/html" in r.headers.get("Content-Type", "")
+
+print("== FLUJO ADMIN ==")
+s = requests.Session()
+r = s.post(AUTH + "/login", data={"correo": "admin@cleoferr.com", "clave": "Admin123!"},
+           allow_redirects=False)
+check("login admin (redirect+cookie)", r.status_code in (200, 302) and "jwt_token" in r.headers.get("Set-Cookie", ""))
+
+rutas_admin = ["/productos", "/pedidos", "/inventario", "/caja",
+               "/alertas", "/proveedores", "/reportes", "/ventas/nueva", "/productos/nuevo"]
+for ruta in rutas_admin:
+    rr = s.get(TIENDA + ruta, allow_redirects=True)
+    ok = rr.status_code == 200 and es_html(rr) and "<" in rr.text
+    sidebar = "sidebar-modulos" in rr.text
+    check(f"GET {ruta}", ok, f"({rr.status_code}, sidebar={'SI' if sidebar else 'NO'})")
+
+print("== FLUJO CLIENTE ==")
+s2 = requests.Session()
+r = s2.post(AUTH + "/login_cliente",
+            data={"correo": "maria.quispe@gmail.com", "contrasena": "Cliente123"},
+            allow_redirects=False)
+check("login cliente (cookie)", r.status_code in (200, 302))
+
+rr = s2.get(TIENDA + "/catalogo")
+check("GET /catalogo HTML", es_html(rr) and "prod-card" in rr.text, f"({rr.status_code})")
+
+rr = s2.get(TIENDA + "/carrito")
+check("GET /carrito HTML", es_html(rr), f"({rr.status_code})")
+fetch_ok = "/ventas/nueva" in rr.text and "confirmar_v2" not in rr.text
+check("carrito fetch apunta a /ventas/nueva", fetch_ok)
+
+# Hijack product list via API (mismo token de sesion)
+prods = s2.get(TIENDA + "/productos", headers={"Accept": "application/json"}).json()["productos"]
+con_stock = [p for p in prods if p["stock"] > 0]
+if len(con_stock) < 2:
+    check("POST /ventas/nueva (online)", False, "(menos de 2 productos con stock)")
 else:
-    print('No jwt_token cookie obtained, skipping test 3')
+    p1 = p2 = None
+con_stock = [p for p in prods if p["stock"] > 0]
+if len(con_stock) < 2:
+    check("POST /ventas/nueva (online)", False, "(menos de 2 productos con stock)")
+else:
+    p1, p2 = con_stock[0], con_stock[1]
+    v = s2.post(TIENDA + "/ventas/nueva", json={
+        "tipo_venta": "online", "metodo_pago": "efectivo",
+        "ids_producto": [p1["id"], p2["id"]], "cantidades": [1, 2],
+        "comp_tipo": "boleta", "comp_doc": "12345678"})
+    ok_venta = v.status_code == 200 and v.json().get("ok")
+    check("POST /ventas/nueva (online)", ok_venta, f"({v.status_code}: {v.json().get('mensaje') or v.json().get('error')})")
 
-print()
-print('=== Prueba 4: GET /catalogo without cookie ===')
-r4 = requests.get('http://127.0.0.1:5002/catalogo')
-print(f'Status: {r4.status_code}')
-print(f'Body: {r4.text[:200]}')
+if ok_venta:
+    rr = s2.get(TIENDA + "/mis_pedidos")
+    check("GET /mis_pedidos HTML con pedido", rr.status_code == 200 and es_html(rr) and str(v.json()["id_venta"]) in rr.text, f"({rr.status_code})")
+    rr = s2.get(TIENDA + "/pedidos/detalle/%d" % v.json()["id_venta"])
+    check("GET /pedidos/detalle HTML", rr.status_code == 200 and es_html(rr), f"({rr.status_code})")
 
-print()
-print('=== Prueba 5: GET /catalogo with corrupt token ===')
-r5 = requests.get('http://127.0.0.1:5002/catalogo', headers={'Authorization': 'Bearer invalidtoken123'})
-print(f'Status: {r5.status_code}')
-print(f'Body: {r5.text[:200]}')
+print("== RESUMEN ==")
+ok_total = sum(1 for _, ok, _ in resultados if ok)
+print(f"{ok_total}/{len(resultados)} OK")
+for nombre, ok, detalle in resultados:
+    if not ok:
+        print(f"  FAIL: {nombre} {detalle}")

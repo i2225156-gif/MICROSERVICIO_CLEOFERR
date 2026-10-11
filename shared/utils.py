@@ -43,16 +43,23 @@ def extract_token_from_header(auth_header):
     return None
 
 
-def extract_token_from_cookie(cookie_str):
-    """Extrae el token del header Set-Cookie o cookie del navegador.
-    
-    Busca un patron como: token=abc123 o jwt=abc123
+def extract_token_from_cookie(cookie_value):
+    """Devuelve el valor de la cookie jwt_token.
+
+    NOTA (bug corregido): antes esta función hacía regex sobre un header
+    completo tipo "jwt_token=abc", pero todos los call sites le pasan el
+    resultado de request.cookies.get("jwt_token") que YA es solo el valor.
+    El regex anterior no hacía match sobre el valor puro y devolvía None,
+    rompiendo el login por cookie. Ahora acepta ambas formas por seguridad:
+      - valor puro del JWT -> se devuelve tal cual
+      - cadena "jwt_token=valor" (header crudo) -> se extrae el valor
     """
-    if not cookie_str:
+    if not cookie_value:
         return None
-    # Buscar token en cookie (patrón simple)
     import re
-    match = re.search(r'(?:token|jwt)=([^;\s]+)', cookie_str)
+    # Si trae formato "nombre=valor", extraer el valor; si no, es el valor puro
+    match = re.search(r'(?:jwt_token|token|jwt)=([^;\s]+)', cookie_value)
     if match:
         return match.group(1)
-    return None
+    # Valor puro (un JWT empieza con "eyJ" típicamente, pero no filtramos)
+    return cookie_value.strip()

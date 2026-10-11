@@ -26,8 +26,86 @@ except Exception as e:
 from db import db
 from db_supabase import get_connection_auth, get_connection_tienda
 from sqlalchemy import text
+import requests
 
 load_dotenv()
+
+# URL base de los microservicios (configurable por entorno)
+AUTH_SERVICE_URL   = os.environ.get("AUTH_SERVICE_URL", "http://127.0.0.1:5001")
+TIENDA_SERVICE_URL = os.environ.get("TIENDA_SERVICE_URL", "http://127.0.0.1:5002")
+
+
+def _llamar_auth_service(method, endpoint, data=None, token=None, timeout=5):
+    """Helper: llamada HTTP al auth_service.
+
+    - method: 'get' | 'post'
+    - endpoint: path bajo AUTH_SERVICE_URL (p. ej. '/login')
+    - data: se envía como form-urlencoded (los endpoints de auth_service
+      leen request.form) y se pide Accept: application/json para obtener
+      siempre JSON en lugar de redirects.
+    - token: JWT opcional; se envía como Authorization: Bearer <token>
+    Devuelve (status_code, dict_json) o (503, {"error": ...}) si el
+    servicio no responde (timeout, conexión rechazada, JSON inválido).
+    Nunca propaga excepciones: la app principal no se cae aunque el
+    microservicio esté caído.
+    """
+    url = f"{AUTH_SERVICE_URL}{endpoint}"
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        if method.lower() == "get":
+            resp = requests.get(url, headers=headers, timeout=timeout)
+        else:
+            resp = requests.post(url, data=data or {}, headers=headers,
+                                 timeout=timeout)
+        try:
+            return resp.status_code, resp.json()
+        except ValueError:
+            app.logger.error("auth_service %s devolvió respuesta no-JSON (%s)",
+                             endpoint, resp.status_code)
+            return 502, {"error": "Respuesta inválida del servicio de autenticación"}
+    except requests.exceptions.Timeout:
+        app.logger.error("Timeout llamando a auth_service %s", endpoint)
+        return 503, {"error": "El servicio de autenticación no responde (timeout)."}
+    except requests.exceptions.RequestException as e:
+        app.logger.error("Error de conexión con auth_service %s: %s", endpoint, e)
+        return 503, {"error": "El servicio de autenticación no está disponible."}
+
+
+def _llamar_tienda_service(method, endpoint, data=None, token=None, timeout=5):
+    """Helper: llamada HTTP al tienda_service (mismo patrón que _llamar_auth_service).
+
+    - method: 'get' | 'post'
+    - endpoint: path bajo TIENDA_SERVICE_URL (p. ej. '/catalogo')
+    - data: para POST se envía como JSON (los endpoints de tienda leen
+      request.get_json(silent=True) con fallback a request.form)
+    - token: JWT opcional; se envía como Authorization: Bearer <token>
+    Devuelve (status_code, dict_json) o (503, {"error": ...}) si el
+    servicio no responde. Nunca propaga excepciones.
+    """
+    url = f"{TIENDA_SERVICE_URL}{endpoint}"
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        if method.lower() == "get":
+            resp = requests.get(url, headers=headers, timeout=timeout)
+        else:
+            resp = requests.post(url, json=data or {}, headers=headers,
+                                 timeout=timeout)
+        try:
+            return resp.status_code, resp.json()
+        except ValueError:
+            app.logger.error("tienda_service %s devolvió respuesta no-JSON (%s)",
+                             endpoint, resp.status_code)
+            return 502, {"error": "Respuesta inválida del servicio de tienda"}
+    except requests.exceptions.Timeout:
+        app.logger.error("Timeout llamando a tienda_service %s", endpoint)
+        return 503, {"error": "El servicio de tienda no responde (timeout)."}
+    except requests.exceptions.RequestException as e:
+        app.logger.error("Error de conexión con tienda_service %s: %s", endpoint, e)
+        return 503, {"error": "El servicio de tienda no está disponible."}
 
 app = Flask(__name__)
 
@@ -37,6 +115,10 @@ if not app.secret_key:
         "SECRET_KEY no definida. Créala en el archivo .env (p. ej. con: "
         "python -c \"import secrets; print(secrets.token_hex(32))\")."
     )
+
+# Nombre de cookie de sesión propio por servicio (las cookies NO se aíslan
+# por puerto en 127.0.0.1; sin esto los servicios se pisan entre sí)
+app.config["SESSION_COOKIE_NAME"] = "front_session"
 
 os.environ['TZ'] = 'America/Lima'
 
@@ -82,75 +164,75 @@ db.init_app(app)
 bcrypt = Bcrypt(app)
 
 
-def _inicializar_schema_auth():
-    """Crea (si no existen) las tablas auxiliares de OTP/verificación en la BD
-    Auth. Precondición: la tabla `cliente` ya debe existir.
-
-    HISTÓRICO/CAUSA DE BUG: el archivo migracion_verificacion.sql definía una
-    tabla `verificacion_registro` con sintaxis MySQL, mientras que el código
-    usa `verificacion_cuenta` (PostgreSQL/Supabase). Si la tabla correcta no
-    se creó, cualquier INSERT de registro falla y el usuario recibe el error
-    genérico "No se pudo iniciar el registro". Este bootstrap es autocorregible.
+def _verificar_schema_solo_lectura():
+    """Verifica solo lectura del esquema Auth al inicio.
+    
+    Hace SELECT contra information_schema para comprobar que las tablas y
+    columnas esperadas existen. NUNCA ejecuta ALTER TABLE, CREATE TABLE ni
+    ningún DDL. Solo registra advertencias si encuentra inconsistencias,
+    pero permite el arranque del servidor ya que la BD puede ser compartida.
     """
+    from db_supabase import get_connection_auth
     conn = None
     cursor = None
     try:
         conn = get_connection_auth()
         cursor = conn.cursor()
+        
+        # Verificar tabla verificacion_cuenta
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS verificacion_cuenta (
-                id_verificacion     SERIAL PRIMARY KEY,
-                id_cliente          INTEGER NOT NULL,
-                codigo_hash         TEXT NOT NULL,
-                creado_en           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                expira_en           TIMESTAMPTZ NOT NULL,
-                usado               BOOLEAN NOT NULL DEFAULT FALSE,
-                intentos_fallidos   INTEGER NOT NULL DEFAULT 0
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables 
+                WHERE table_schema = 'public' AND table_name = 'verificacion_cuenta'
             )
         """)
+        verif_exists = cursor.fetchone()[0]
+        if not verif_exists:
+            app.logger.warning("Tabla verificacion_cuenta no encontrada en BD Auth. "
+                              "El registro de clientes con OTP puede fallar.")
+        else:
+            app.logger.debug("Tabla verificacion_cuenta existe en BD Auth.")
+        
+        # Verificar tabla recuperacion_contrasena
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS recuperacion_contrasena (
-                id_recuperacion     SERIAL PRIMARY KEY,
-                id_usuario          INTEGER,
-                id_cliente          INTEGER,
-                codigo_hash         TEXT NOT NULL,
-                creado_en           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                expira_en           TIMESTAMPTZ NOT NULL,
-                usado               BOOLEAN NOT NULL DEFAULT FALSE,
-                intentos_fallidos   INTEGER NOT NULL DEFAULT 0,
-                ip_solicitud        VARCHAR(64)
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables 
+                WHERE table_schema = 'public' AND table_name = 'recuperacion_contrasena'
             )
         """)
-        conn.commit()
-        # Funcionalidad 1 (POS): columna `origen` para distinguir clientes creados
-        # desde el Punto de Venta (origen='pos') de los registrados por la web
-        # (origen='web'). Autocorrección igual que las tablas OTP: si el SQL de
-        # migración no se ejecutó, se agrega aquí al arrancar la app.
+        rec_exists = cursor.fetchone()[0]
+        if not rec_exists:
+            app.logger.warning("Tabla recuperacion_contrasena no encontrada en BD Auth. "
+                              "La recuperación de contraseña puede fallar.")
+        else:
+            app.logger.debug("Tabla recuperacion_contrasena existe en BD Auth.")
+        
+        # Verificar columna origen en cliente
         cursor.execute("""
-            ALTER TABLE cliente
-                ADD COLUMN IF NOT EXISTS origen VARCHAR(10) NOT NULL DEFAULT 'web'
+            SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'cliente'
+                AND column_name = 'origen'
+            )
         """)
-        conn.commit()
-        # Índice único parcial por documento: evita duplicar clientes al repetir
-        # el mismo DNI/RUC desde el POS. Excluye ''/NULL (clientes web en registro).
-        # Se aplica en commit aparte para que si existen duplicados viejos en
-        # producción, el fallo de este índice NO revierta la columna origen.
-        cursor.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS uq_cliente_documento
-            ON cliente (id_tipo_documento, nro_documento)
-            WHERE nro_documento IS NOT NULL AND nro_documento <> ''
-        """)
-        conn.commit()
-        # Funcionalidad 1 (POS): los clientes creados desde el Punto de Venta no
-        # tienen credenciales web (email y contrasena NULL por diseño; no pueden
-        # iniciar sesión y el modal POS ni siquiera los solicita). `telefono` y
-        # `direccion` también son opcionales (modal POS y formulario web los
-        # validan a nivel de aplicación, no de BD). Si la BD Auth los declara
-        # NOT NULL, el INSERT de /clientes/registrar_pos falla con
-        # "null value in column ... violates not-null constraint". Aquí se
-        # alinea la BD con el modelo de la app: solo se liberan las columnas
-        # que EL PROPIO CÓDIGO envía como NULL y que el negocio no exige.
-        # El registro web sigue exigiendo email y dirección en el formulario.
+        origen_exists = cursor.fetchone()[0]
+        if not origen_exists:
+            app.logger.warning("Columna 'origen' no existe en tabla cliente. "
+                              "Clientes POS pueden no distinguirse correctamente.")
+        else:
+            # Verificar que acepta NULL (lo ideal para POS)
+            cursor.execute("""
+                SELECT is_nullable FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'cliente'
+                AND column_name = 'origen'
+            """)
+            _row = cursor.fetchone()
+            if _row and _row[0] == 'YES':
+                app.logger.debug("Columna 'origen' en cliente acepta NULL (correcto para POS).")
+            else:
+                app.logger.debug("Columna 'origen' en cliente existe pero no necesariamente NULL.")
+        
+        # Verificar columnas que el bootstrap solía poner sin NOT NULL
         for _col in ('email', 'contrasena', 'telefono', 'direccion'):
             cursor.execute("""
                 SELECT is_nullable FROM information_schema.columns
@@ -158,19 +240,17 @@ def _inicializar_schema_auth():
                   AND column_name = %s
             """, (_col,))
             _row = cursor.fetchone()
-            if _row is not None and _row[0] == 'NO':
-                cursor.execute(
-                    'ALTER TABLE cliente ALTER COLUMN %s DROP NOT NULL' % _col
-                )
-                conn.commit()
-        app.logger.info("Esquema Auth verificado (verificacion_cuenta / recuperacion_contrasena / origen / columnas opcionales POS).")
+            if _row:
+                if _row[0] == 'YES':
+                    app.logger.debug(f"Columna '{_col}' en cliente ya acepta NULL.")
+                else:
+                    app.logger.debug(f"Columna '{_col}' en cliente es NOT NULL (validación a nivel de app).")
+            else:
+                app.logger.warning(f"Columna '{_col}' no existe en tabla cliente.")
+        
+        app.logger.info("Verificación de esquema Auth completada (solo lectura, sin modificaciones).")
     except Exception as e:
-        app.logger.error(f"No se pudo crear el esquema auxiliar Auth: {e}")
-        if conn is not None:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
+        app.logger.error(f"Error verificando esquema Auth: {e}")
     finally:
         if conn is not None:
             try:
@@ -179,8 +259,9 @@ def _inicializar_schema_auth():
                 pass
 
 
-with app.app_context():
-    _inicializar_schema_auth()
+if os.environ.get("BOOTSTRAP_DB"):
+    with app.app_context():
+        _verificar_schema_solo_lectura()
 
 
 def enviar_correo(destino, asunto, cuerpo_html, cuerpo_texto=None):
@@ -352,38 +433,45 @@ def _ctx_recuperacion_origen():
 
 @app.route('/')
 def inicio():
-    return redirect(url_for('catalogo_cliente'))
+    # Puerta de entrada principal: redirect al login del auth_service (5001).
+    # En la arquitectura de microservicios la entrada es sempre http://127.0.0.1:5001/login.
+    return redirect("http://127.0.0.1:5001/login")
 
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
+    # Login dirigido al auth_service (5001). Este gateway solo redirige.
+    return redirect("http://127.0.0.1:5001/login")
+
+
+# Rutas legacy: migradas a los microservicios (5001/5002).
+# Ya no son la puerta de entrada del usuario, pero se conservan por compatibilidad.
+@app.route('/login_gateway_obsoleto', methods=['GET', 'POST'])
+def login_gateway_obsoleto():
     if request.method == 'POST':
         correo = request.form['correo']
         clave  = request.form['clave']
         clave_lim = _clave_login(correo)
         if _bloqueado_login(clave_lim):
             return render_template('login.html', error='Demasiados intentos fallidos. Espera 15 minutos e inténtalo de nuevo.')
-        conn   = get_connection_auth()
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("""
-            SELECT u.id_usuario, u.nombres, u.email, u.contrasena, r.nombre AS rol
-            FROM usuario u
-            INNER JOIN rol r ON u.id_rol = r.id_rol
-            WHERE u.email = %s
-        """, (correo,))
-        usuario = cursor.fetchone()
-        conn.close()
 
-        if usuario and bcrypt.check_password_hash(usuario['contrasena'], clave):
-            rol_usuario = (usuario.get('rol') or '').lower()
-           
+        # Llamada HTTP a auth_service (emite JSON porque pedimos Accept: application/json)
+        status, resp_json = _llamar_auth_service('post', '/login',
+                                                 data={'correo': correo, 'clave': clave})
+        if status == 503:
+            return render_template('login.html', error=resp_json.get('error'))
+
+        if status == 200 and resp_json.get('exito'):
+            rol_usuario = (resp_json.get('rol') or '').lower()
+
             if rol_usuario not in ('administrador', 'vendedor'):
-              
+
                 return render_template('login.html', error='Acceso restringido. Esta sección es solo para el personal administrativo de CLEOFERR.')
             _resetear_login(clave_lim)
-            session['usuario_id'] = usuario['id_usuario']
-            session['rol']        = usuario['rol']
-            session['nombre']     = usuario['nombres']
+            session['usuario_id'] = resp_json['usuario_id']
+            session['rol']        = resp_json['rol']
+            session['nombre']     = resp_json.get('nombre')
+            session['jwt_token']  = resp_json.get('token')
             return redirect(url_for('productos'))
         _registrar_error_login(clave_lim)
         return render_template('login.html', error='Credenciales incorrectas')
@@ -405,39 +493,26 @@ def login_cliente():
         if _bloqueado_login(clave_lim):
             return render_template('login_cliente.html',
                                    error='Demasiados intentos fallidos. Espera 15 minutos e inténtalo de nuevo.')
-        conn       = get_connection_auth()
-        cursor     = conn.cursor(dictionary=True)
-        # Busca el cliente por email — la columna nombre puede variar
-        cursor.execute("SELECT * FROM cliente WHERE email = %s", (correo,))
-        cliente = cursor.fetchone()
-        conn.close()
 
-        if cliente:
-            # Cuenta registrada pero sin verificar su correo
-            if not cliente.get('activo'):
-                return render_template('login_cliente.html',
-                                       error='Tu cuenta aún no está verificada. Completa el registro con el código enviado a tu correo.',
-                                       registro_activo=True)
-            # Solo Bcrypt: las contraseñas de clientes deben estar hasheadas con bcrypt.
-            # Si el hash almacenado no es bcrypt válido, el acceso se rechaza.
-            stored = cliente.get('contrasena') or cliente.get('password') or ''
-            try:
-                ok = bcrypt.check_password_hash(stored, contrasena)
-            except (ValueError, TypeError):
-                ok = False
+        # Llamada HTTP a auth_service (JSON)
+        status, resp_json = _llamar_auth_service('post', '/login_cliente',
+                                                 data={'correo': correo, 'contrasena': contrasena})
+        if status == 503:
+            return render_template('login_cliente.html', error=resp_json.get('error'))
 
-            if ok:
-                _resetear_login(clave_lim)
-                nombre_cliente = (
-                    cliente.get('nombre') or
-                    cliente.get('nombres') or
-                    cliente.get('name') or
-                    cliente.get('email')
-                )
-                session['usuario_id'] = cliente.get('id_cliente') or cliente.get('id')
-                session['rol']        = 'cliente'
-                session['nombre']     = nombre_cliente
-                return redirect(url_for('catalogo_cliente'))
+        # Cuenta registrada pero sin verificar su correo
+        if status == 403 and resp_json.get('cuenta_no_verificada'):
+            return render_template('login_cliente.html',
+                                   error=resp_json.get('error'),
+                                   registro_activo=True)
+
+        if status == 200 and resp_json.get('exito'):
+            _resetear_login(clave_lim)
+            session['usuario_id'] = resp_json.get('usuario_id')
+            session['rol']        = 'cliente'
+            session['nombre']     = resp_json.get('nombre')
+            session['jwt_token']  = resp_json.get('token')
+            return redirect(url_for('catalogo_cliente'))
 
         _registrar_error_login(clave_lim)
         return render_template('login_cliente.html', error='Credenciales incorrectas')
@@ -975,19 +1050,14 @@ def eliminar_producto(id):
 
 @app.route('/catalogo')
 def catalogo_cliente():
-    conn   = get_connection_tienda()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("""
-        SELECT p.*, c.nombre AS categoria, m.nombre AS marca
-        FROM producto p
-        LEFT JOIN categoria c ON p.id_categoria = c.id_categoria
-        LEFT JOIN marca m ON p.id_marca = m.id_marca
-        WHERE p.activo = TRUE
-        ORDER BY p.id_producto
-    """)
-    lista = cursor.fetchall()
-    conn.close()
-    return render_template('catalogo.html', productos=lista)
+    # Catálogo público servido por el FRONTEND: los datos vienen de
+    # tienda_service vía HTTP (este es el endpoint que el usuario abre en
+    # el navegador; tienda_service:5002 es interno y devuelve JSON puro).
+    status, resp_json = _llamar_tienda_service('get', '/catalogo')
+    if status != 200 or not resp_json.get('exito'):
+        flash(resp_json.get('error', 'No se pudo cargar el catálogo.'), 'danger')
+        return render_template('catalogo.html', productos=[])
+    return render_template('catalogo.html', productos=resp_json.get('productos', []))
 
 
 # ── Gestión de Clientes ───────────────────────────────────────
@@ -995,17 +1065,28 @@ def catalogo_cliente():
 @login_required
 @escritura_required
 def clientes():
-    conn   = get_connection_auth()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("""
-        SELECT column_name FROM information_schema.columns
-        WHERE table_schema = 'public' AND table_name = 'cliente'
-        ORDER BY ordinal_position
-    """)
-    columnas = [c['column_name'] for c in cursor.fetchall()]
-    cursor.execute("SELECT * FROM cliente ORDER BY id_cliente DESC")
-    lista = cursor.fetchall()
-    conn.close()
+    # Llamada HTTP a auth_service con el JWT de la sesión
+    token = session.get('jwt_token')
+    if not token:
+        flash('Tu sesión no tiene token de autenticación. Inicia sesión de nuevo.', 'warning')
+        return redirect(url_for('login'))
+    status, resp_json = _llamar_auth_service('get', '/clientes', token=token)
+    if status == 401:
+        session.pop('jwt_token', None)
+        flash('Sesión expirada. Inicia sesión de nuevo.', 'warning')
+        return redirect(url_for('login'))
+    if status != 200:
+        flash(resp_json.get('error', 'No se pudo obtener el listado de clientes.'), 'danger')
+        return render_template('clientes.html', clientes=[], columnas=[])
+
+    lista = resp_json.get('clientes', [])
+    # El template recibía la lista de columnas (el monolito la leía de
+    # information_schema); se reconstruye a partir de las claves del primer
+    # registro para no modificar el template.
+    columnas = list(lista[0].keys()) if lista else [
+        'id_cliente', 'nombre', 'apellido', 'email', 'telefono', 'direccion',
+        'id_tipo_documento', 'nro_documento', 'activo', 'origen',
+    ]
     return render_template('clientes.html', clientes=lista, columnas=columnas)
 
 
@@ -1014,27 +1095,18 @@ def clientes():
 @escritura_required
 def nuevo_cliente():
     if request.method == 'POST':
-        nombre    = request.form['nombre']
-        email     = request.form['email']
-        telefono  = request.form.get('telefono', '')
-        direccion = request.form.get('direccion', '')
-        contrasena = request.form.get('contrasena', '123456')
-        hash_pw   = bcrypt.generate_password_hash(contrasena).decode('utf-8')
-
-        conn   = get_connection_auth()
-        cursor = conn.cursor()
-        try:
-            cursor.execute(
-                "INSERT INTO cliente (nombre, email, telefono, direccion, contrasena) VALUES (%s,%s,%s,%s,%s)",
-                (nombre, email, telefono, direccion, hash_pw)
-            )
-            conn.commit()
+        # Llamada HTTP a auth_service (el hash de contraseña se hace allí)
+        status, resp_json = _llamar_auth_service('post', '/clientes/nuevo',
+                                                 data={'nombre': request.form['nombre'],
+                                                       'email': request.form['email'],
+                                                       'telefono': request.form.get('telefono', ''),
+                                                       'direccion': request.form.get('direccion', ''),
+                                                       'contrasena': request.form.get('contrasena', '123456')},
+                                                 token=session.get('jwt_token'))
+        if status == 200 and resp_json.get('exito'):
             flash("Cliente registrado correctamente.", "success")
-        except Exception as e:
-            conn.rollback()
-            flash(f"Error al registrar cliente: {e}", "danger")
-        finally:
-            conn.close()
+        else:
+            flash(resp_json.get('error', 'Error al registrar cliente.'), 'danger')
         return redirect(url_for('clientes'))
     return render_template('cliente_form.html')
 
@@ -1043,34 +1115,33 @@ def nuevo_cliente():
 @login_required
 @escritura_required
 def editar_cliente(id):
-    conn   = get_connection_auth()
-    cursor = conn.cursor(dictionary=True)
+    token = session.get('jwt_token')
+    if not token:
+        flash('Tu sesión no tiene token de autenticación. Inicia sesión de nuevo.', 'warning')
+        return redirect(url_for('login'))
     if request.method == 'POST':
-        nombre    = request.form['nombre']
-        email     = request.form['email']
-        telefono  = request.form.get('telefono', '')
-        direccion = request.form.get('direccion', '')
-        try:
-            cursor.execute(
-                "UPDATE cliente SET nombre=%s, email=%s, telefono=%s, direccion=%s WHERE id_cliente=%s",
-                (nombre, email, telefono, direccion, id)
-            )
-            conn.commit()
+        # Llamada HTTP a auth_service
+        status, resp_json = _llamar_auth_service('post', f'/clientes/editar/{id}',
+                                                 data={'nombre': request.form['nombre'],
+                                                       'email': request.form['email'],
+                                                       'telefono': request.form.get('telefono', ''),
+                                                       'direccion': request.form.get('direccion', '')},
+                                                 token=token)
+        if status == 200 and resp_json.get('exito'):
             flash("Cliente actualizado correctamente.", "success")
-        except Exception as e:
-            conn.rollback()
-            flash(f"Error: {e}", "danger")
-        finally:
-            conn.close()
+        else:
+            flash(resp_json.get('error', 'Error al actualizar cliente.'), 'danger')
         return redirect(url_for('clientes'))
 
-    cursor.execute("SELECT * FROM cliente WHERE id_cliente = %s", (id,))
-    cliente = cursor.fetchone()
-    conn.close()
-    if not cliente:
+    # GET: obtener datos del cliente vía auth_service
+    status, resp_json = _llamar_auth_service('get', f'/clientes/{id}', token=token)
+    if status == 404:
         flash("Cliente no encontrado.", "danger")
         return redirect(url_for('clientes'))
-    return render_template('cliente_form.html', cliente=cliente)
+    if status != 200:
+        flash(resp_json.get('error', 'No se pudo obtener el cliente.'), 'danger')
+        return redirect(url_for('clientes'))
+    return render_template('cliente_form.html', cliente=resp_json.get('cliente'))
 
 
 # ── Registro rápido de cliente desde el Punto de Venta (por DNI/RUC) ────────
@@ -1111,73 +1182,39 @@ def registrar_pos():
     if telefono and (not telefono.isdigit() or len(telefono) != 9):
         return {'ok': False, 'error': 'El teléfono debe tener exactamente 9 dígitos.'}, 400
 
-    id_tipo_doc = 1 if tipo == 'boleta' else 6
-    conn   = get_connection_auth()
-    cursor = conn.cursor(dictionary=True)
+    # Llamada HTTP a auth_service (este endpoint consume JSON, no form)
     try:
-        # ¿Ya existe un cliente con ese documento? → se reutiliza (no se duplica)
-        cursor.execute("""
-            SELECT id_cliente, nombre, apellido, telefono FROM cliente
-            WHERE id_tipo_documento = %s AND nro_documento = %s
-        """, (id_tipo_doc, doc))
-        existente = cursor.fetchone()
-        if existente:
-            if telefono and not (existente.get('telefono') or '').strip():
-                cursor.execute(
-                    "UPDATE cliente SET telefono = %s WHERE id_cliente = %s",
-                    (telefono, existente['id_cliente']))
-                conn.commit()
-            nombre_existente = f"{existente.get('nombre') or ''} {existente.get('apellido') or ''}".strip()
-            return {'ok': True, 'id_cliente': existente['id_cliente'],
-                    'nombre': nombre_existente, 'ya_existia': True}
-
-        # `apellido` es NOT NULL en la BD. Si no se envió y es una boleta (RENIEC:
-        # Nombres ApellidoPaterno ApellidoMaterno), separamos el nombre completo;
-        # como último recurso usamos '' (cadena vacía respeta NOT NULL). En
-        # factura, la razón social se guarda completa en `nombre` y `apellido` ''.
-        nombre_db   = nombre
-        apellido_db = apellido
-        if not apellido_db and tipo == 'boleta':
-            partes = nombre.split()
-            if len(partes) >= 2:
-                nombre_db   = partes[0]
-                apellido_db = ' '.join(partes[1:])
-        cursor.execute("""
-            INSERT INTO cliente (nombre, apellido, email, telefono, id_tipo_documento,
-                                 nro_documento, direccion, contrasena, activo, origen)
-            VALUES (%s, %s, NULL, %s, %s, %s, %s, NULL, TRUE, 'pos')
-            RETURNING id_cliente
-        """, (nombre_db, apellido_db, telefono or None, id_tipo_doc, doc,
-              direccion or None))
-        id_cliente = cursor.fetchone()['id_cliente']
-        conn.commit()
-        # Nombre completo para mostrar en el select del POS
-        nombre_mostrar = f"{nombre_db} {apellido_db}".strip()
-        return {'ok': True, 'id_cliente': id_cliente, 'nombre': nombre_mostrar,
-                'ya_existia': False}
-    except Exception as e:
-        conn.rollback()
-        app.logger.error("Error al registrar cliente desde el POS: %s", e)
-        return {'ok': False, 'error': 'No se pudo guardar el cliente (error interno).'}, 500
-    finally:
-        conn.close()
+        headers = {"Accept": "application/json"}
+        token = session.get('jwt_token')
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        resp = requests.post(f"{AUTH_SERVICE_URL}/clientes/registrar_pos",
+                             json=data, headers=headers, timeout=5)
+        try:
+            return resp.json(), resp.status_code
+        except ValueError:
+            app.logger.error("auth_service /clientes/registrar_pos devolvió no-JSON (%s)",
+                             resp.status_code)
+            return {'ok': False, 'error': 'Respuesta inválida del servicio de autenticación.'}, 502
+    except requests.exceptions.Timeout:
+        return {'ok': False, 'error': 'El servicio de autenticación no responde (timeout).'}, 503
+    except requests.exceptions.RequestException as e:
+        app.logger.error("Error de conexión con auth_service /clientes/registrar_pos: %s", e)
+        return {'ok': False, 'error': 'El servicio de autenticación no está disponible.'}, 503
 
 
 @app.route('/clientes/eliminar/<int:id>')
 @login_required
 @admin_required
 def eliminar_cliente(id):
-    conn   = get_connection_auth()
-    cursor = conn.cursor()
-    try:
-        cursor.execute("DELETE FROM cliente WHERE id_cliente = %s", (id,))
-        conn.commit()
+    # Llamada HTTP a auth_service
+    token = session.get('jwt_token')
+    status, resp_json = _llamar_auth_service('get', f'/clientes/eliminar/{id}',
+                                             token=token)
+    if status == 200 and resp_json.get('exito'):
         flash("Cliente eliminado.", "success")
-    except Exception as e:
-        conn.rollback()
-        flash(f"Error: {e}", "danger")
-    finally:
-        conn.close()
+    else:
+        flash(resp_json.get('error', 'Error al eliminar cliente.'), 'danger')
     return redirect(url_for('clientes'))
 
 
@@ -2460,19 +2497,28 @@ def cambiar_clave():
         confirmar = request.form['confirmar']
         if nueva != confirmar:
             return render_template('cambiar_clave.html', error='Las contraseñas no coinciden')
-        nueva_hash = bcrypt.generate_password_hash(nueva).decode('utf-8')
-        conn   = get_connection_auth()
-        cursor = conn.cursor()
-        if es_cliente:
-            cursor.execute("UPDATE cliente SET contrasena = %s WHERE id_cliente = %s",
-                           (nueva_hash, session['usuario_id']))
-        else:
-            cursor.execute("UPDATE usuario SET contrasena = %s WHERE id_usuario = %s",
-                           (nueva_hash, session['usuario_id']))
-        conn.commit()
-        conn.close()
-        flash("Contraseña actualizada correctamente.", "success")
-        return redirect(url_for('catalogo_cliente') if es_cliente else url_for('productos'))
+        clave_actual = request.form.get('clave_actual', '')
+
+        # Llamada HTTP a auth_service con el JWT de la sesión
+        token = session.get('jwt_token')
+        if not token:
+            flash("Tu sesión no tiene token de autenticación. Inicia sesión de nuevo.", "warning")
+            return redirect(url_for('login_cliente') if es_cliente else url_for('login'))
+        status, resp_json = _llamar_auth_service('post', '/cambiar_clave',
+                                                 data={'clave_actual': clave_actual,
+                                                       'clave_nueva': nueva,
+                                                       'confirmar': confirmar},
+                                                 token=token)
+        if status in (400, 401, 404):
+            return render_template('cambiar_clave.html',
+                                   error=resp_json.get('error') or 'No se pudo actualizar la contraseña.')
+        if status == 503:
+            return render_template('cambiar_clave.html', error=resp_json.get('error'))
+        if status == 200 and resp_json.get('ok'):
+            flash("Contraseña actualizada correctamente.", "success")
+            return redirect(url_for('catalogo_cliente') if es_cliente else url_for('productos'))
+        return render_template('cambiar_clave.html',
+                               error=resp_json.get('error') or 'Error al actualizar la contraseña.')
     return render_template('cambiar_clave.html')
 
 
@@ -2535,108 +2581,42 @@ def registro_cliente():
                                error='Las contraseñas no coinciden.',
                                registro_activo=True)
 
-    codigo      = str(random.randint(100000, 999999))
-    hash_pw     = bcrypt.generate_password_hash(contrasena).decode('utf-8')
-    codigo_hash = bcrypt.generate_password_hash(codigo).decode('utf-8')
-
-    conn   = get_connection_auth()
-    cursor = conn.cursor(dictionary=True)
-    try:
-        # ¿Ya existe el correo?
-        cursor.execute("SELECT id_cliente, activo FROM cliente WHERE email = %s", (correo,))
-        existente = cursor.fetchone()
-        if existente and existente['activo']:
-            return render_template('login_cliente.html',
-                                   error='Este correo ya está registrado. Inicia sesión.',
-                                   registro_activo=True)
-
-        if existente:
-            # Registro pendiente de verificación: actualizar datos del formulario
-            id_cliente = existente['id_cliente']
-            cursor.execute("""
-                UPDATE cliente SET nombre=%s, apellido=%s, telefono=%s, contrasena=%s, direccion=%s
-                WHERE id_cliente=%s
-            """, (nombre, apellido or '', telefono or None, hash_pw, direccion, id_cliente))
-        else:
-            # id_tipo_documento=1 (DNI) y nro_documento vacío ('') por defecto;
-            # el formulario web no pide documento todavía
-            cursor.execute("""
-                INSERT INTO cliente (nombre, apellido, email, telefono, contrasena,
-                                     id_tipo_documento, nro_documento, direccion, activo)
-                VALUES (%s, %s, %s, %s, %s, 1, '', %s, FALSE)
-                RETURNING id_cliente
-            """, (nombre, apellido or '', correo, telefono or None, hash_pw, direccion))
-            id_cliente = cursor.fetchone()['id_cliente']
-
-        # Invalidar códigos anteriores de este cliente y guardar el nuevo (solo el hash)
-        cursor.execute("""
-            UPDATE verificacion_cuenta SET usado = TRUE
-            WHERE id_cliente = %s AND usado = FALSE
-        """, (id_cliente,))
-        cursor.execute("""
-            INSERT INTO verificacion_cuenta (id_cliente, codigo_hash, creado_en, expira_en, usado)
-            VALUES (%s, %s, NOW(), NOW() + INTERVAL '10 minutes', FALSE)
-        """, (id_cliente, codigo_hash))
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        # ── Log detallado real (no engañar al usuario ni al debug) ──
-        import traceback
-        app.logger.error(
-            "Error en registro_cliente (correo=%s): %s\n%s",
-            correo, e, traceback.format_exc()
-        )
-        print(f"ERROR registro_cliente [{correo}]: {e}")
-        # Validación de datos / conflictos → mensaje específico
-        if 'already exists' in str(e).lower() or 'duplicate' in str(e).lower():
-            msg = 'Este correo o teléfono ya está registrado. Intenta iniciar sesión.'
-        elif 'not null' in str(e).lower():
-            msg = 'Faltan datos obligatorios para crear la cuenta. Completa todos los campos.'
-        elif 'verificacion_cuenta' in str(e).lower() or 'relation' in str(e).lower():
-            msg = 'Error interno: la tabla de verificación no existe. Contacta al administrador.'
-        else:
-            msg = 'No se pudo iniciar el registro (error interno). Contacta al administrador.'
+    # Llamada HTTP a auth_service (validaciones de correo duplicado, insert
+    # de cliente, OTP y envío de correo se ejecutan allí)
+    status, resp_json = _llamar_auth_service('post', '/registro_cliente',
+                                             data={
+                                                 'nombre': nombre,
+                                                 'apellido': apellido,
+                                                 'correo': correo,
+                                                 'telefono': telefono,
+                                                 'direccion': direccion,
+                                                 'contrasena': contrasena,
+                                                 'confirmar': confirmar,
+                                             })
+    if status == 503:
         return render_template('login_cliente.html',
-                               error=msg,
+                               error=resp_json.get('error'),
                                registro_activo=True)
-    finally:
-        conn.close()
+    if status == 409 or (status in (400, 500) and not resp_json.get('exito')):
+        return render_template('login_cliente.html',
+                               error=resp_json.get('error'),
+                               registro_activo=True)
+    if status != 200 or not resp_json.get('exito'):
+        return render_template('login_cliente.html',
+                               error=resp_json.get('error') or 'No se pudo iniciar el registro.',
+                               registro_activo=True)
 
     # En sesión solo queda el correo (el código vive en la BD Auth)
     session['reg_correo'] = correo
 
-    resultado = enviar_correo(
-        correo,
-        f'Tu código de verificación CLEOFERR: {codigo}',
-        _correo_html_codigo(nombre, codigo, 'Tu código de verificación para crear tu cuenta es:'),
-        f"Hola {nombre},\n\nTu código de verificación es: {codigo}\n\nVálido por 10 minutos."
-    )
-
-    if resultado == 'smtp_no_configurado':
-        # SMTP no configurado: modo desarrollo, mostrar el código en pantalla
+    if resp_json.get('codigo_visible'):
+        # SMTP no disponible (dev / error de envío): mostrar el código en pantalla
         return render_template('login_cliente.html',
                                verificar_activo=True,
                                correo_verificar=correo,
-                               codigo_visible=codigo,
-                               aviso_smtp=True)
-    if resultado in ('smtp_auth', 'smtp_error', 'error'):
-        # El código YA quedó almacenado en BD (transacción confirmada arriba).
-        # Para no dejar al usuario bloqueado, mostramos la pantalla de
-        # verificación con el código en pantalla + aviso de que el correo
-        # no se pudo enviar (SMTP mal configurado / credenciales inválidas).
-        app.logger.error(f"No se pudo enviar el correo de verificación a {correo} "
-                         f"(resultado: {resultado}). El código se muestra en pantalla.")
-        return render_template('login_cliente.html',
-                               verificar_activo=True,
-                               correo_verificar=correo,
-                               codigo_visible=codigo,
+                               codigo_visible=resp_json['codigo_visible'],
                                aviso_smtp=True,
-                               aviso_smtp_motivo=(
-                                   'Credenciales SMTP inválidas (revisa SMTP_USER/SMTP_PASS '
-                                   'usando una contraseña de aplicación de Gmail).'
-                                   if resultado == 'smtp_auth'
-                                   else 'El servicio de correo presentó un error. Revisa el log del backend.'
-                               ))
+                               aviso_smtp_motivo=resp_json.get('aviso_smtp_motivo'))
 
     return render_template('login_cliente.html',
                            verificar_activo=True,
@@ -2654,108 +2634,35 @@ def verificar_registro():
                                error='Sesión expirada. Por favor regístrate de nuevo.',
                                registro_activo=True)
 
-    conn   = get_connection_auth()
-    cursor = conn.cursor(dictionary=True)
-    try:
-        # Cliente pendiente de verificación
-        cursor.execute("SELECT id_cliente FROM cliente WHERE email = %s", (correo,))
-        cliente = cursor.fetchone()
-        if not cliente:
-            return render_template('login_cliente.html',
-                                   error='No hay un registro pendiente para este correo.',
-                                   registro_activo=True)
-        id_cliente = cliente['id_cliente']
+    # Llamada HTTP a auth_service (validación OTP, expiración, intentos y
+    # activación de la cuenta se ejecutan allí)
+    status, resp_json = _llamar_auth_service('post', '/verificar_registro',
+                                             data={'correo': correo,
+                                                   'codigo': codigo_ingresado})
 
-        # Último código vigente no usado para ese cliente
-        cursor.execute("""
-            SELECT id_verificacion, codigo_hash, expira_en, intentos_fallidos
-            FROM verificacion_cuenta
-            WHERE id_cliente = %s AND usado = FALSE
-            ORDER BY creado_en DESC LIMIT 1
-        """, (id_cliente,))
-        verif = cursor.fetchone()
-
-        if not verif:
-            return render_template('login_cliente.html',
-                                   error='No hay un código activo. Solicita uno nuevo desde el registro.',
-                                   verificar_activo=True,
-                                   correo_verificar=correo)
-
-        from datetime import datetime, timezone
-        if verif['expira_en'] < datetime.now(timezone.utc):
-            return render_template('login_cliente.html',
-                                   error='El código expiró. Regístrate de nuevo para recibir uno nuevo.',
-                                   verificar_activo=True,
-                                   correo_verificar=correo)
-
-        # Bloqueo tras 5 intentos fallidos (mismo criterio que la recuperación de contraseña)
-        if verif['intentos_fallidos'] >= 5:
-            cursor.execute("UPDATE verificacion_cuenta SET usado = TRUE WHERE id_verificacion = %s",
-                           (verif['id_verificacion'],))
-            conn.commit()
-            return render_template('login_cliente.html',
-                                   error='Demasiados intentos fallidos. Regístrate de nuevo para recibir un código nuevo.',
-                                   verificar_activo=True,
-                                   correo_verificar=correo)
-
-        try:
-            coincide = bcrypt.check_password_hash(verif['codigo_hash'], codigo_ingresado)
-        except (ValueError, TypeError):
-            coincide = False
-
-        if not coincide:
-            intentos = verif['intentos_fallidos'] + 1
-            cursor.execute("""
-                UPDATE verificacion_cuenta
-                SET intentos_fallidos = %s, usado = (CASE WHEN %s >= 5 THEN TRUE ELSE usado END)
-                WHERE id_verificacion = %s
-            """, (intentos, intentos, verif['id_verificacion']))
-            conn.commit()
-            return render_template('login_cliente.html',
-                                   error=('Demasiados intentos fallidos. Regístrate de nuevo '
-                                          'para recibir un código nuevo.' if intentos >= 5
-                                          else f'Código incorrecto. Te quedan {5 - intentos} intentos.'),
-                                   verificar_activo=True,
-                                   correo_verificar=correo)
-
-        # Código correcto: marcarlo usado y activar la cuenta
-        cursor.execute("UPDATE verificacion_cuenta SET usado = TRUE WHERE id_verificacion = %s",
-                       (verif['id_verificacion'],))
-        cursor.execute("UPDATE cliente SET activo = TRUE WHERE id_cliente = %s", (id_cliente,))
-        conn.commit()
+    if status == 200 and resp_json.get('exito'):
         session.pop('reg_correo', None)
         return render_template('login_cliente.html',
-                               success='¡Cuenta creada y verificada! Ya puedes iniciar sesión.')
-    except Exception as e:
-        conn.rollback()
-        app.logger.error(f"Error en verificar_registro: {e}")
+                               success=resp_json.get('mensaje'))
+
+    if status in (400, 404) or status == 503:
+        # Sesión inválida / registro inexistente / servicio caído
         return render_template('login_cliente.html',
-                               error='Error al verificar el código. Intenta de nuevo.',
+                               error=resp_json.get('error'),
                                registro_activo=True)
-    finally:
-        conn.close()
+
+    # 401 código incorrecto / bloqueado, 410 expirado o sin código activo:
+    # se reenvía a la pantalla de verificación
+    return render_template('login_cliente.html',
+                           error=resp_json.get('error'),
+                           verificar_activo=True,
+                           correo_verificar=correo)
 
 
 # ── Recuperación de contraseña ──────────────────────────────
-def _buscar_cuenta_por_correo(cursor, correo):
-    """Busca el correo en usuario y en cliente (BD Auth).
-    Devuelve (tipo, dict) donde tipo es 'usuario' o 'cliente', o (None, None)."""
-    cursor.execute("SELECT id_usuario, nombres FROM usuario WHERE email = %s", (correo,))
-    u = cursor.fetchone()
-    if u:
-        return 'usuario', u
-    cursor.execute("SELECT id_cliente, nombre FROM cliente WHERE email = %s", (correo,))
-    c = cursor.fetchone()
-    if c:
-        return 'cliente', c
-    return None, None
-
-
 @app.route('/recuperar_contrasena', methods=['GET', 'POST'])
 def recuperar_contrasena():
     """Paso 1: el usuario ingresa su correo y recibe un código OTP de 6 dígitos."""
-    import random
-
     if request.method == 'GET':
         return render_template('recuperar_contrasena.html')
 
@@ -2764,59 +2671,22 @@ def recuperar_contrasena():
         return render_template('recuperar_contrasena.html',
                                error='Ingresa tu correo electrónico.')
 
-    conn   = get_connection_auth()
-    cursor = conn.cursor(dictionary=True)
-    try:
-        tipo, cuenta = _buscar_cuenta_por_correo(cursor, correo)
-        if not cuenta:
-            # Mensaje genérico para no revelar si el correo existe o no
-            return render_template('recuperar_contrasena.html',
-                                   verificar_activo=True, correo_verificar=correo)
-
-        nombre = cuenta.get('nombres') or cuenta.get('nombre') or correo
-        codigo = str(random.randint(100000, 999999))
-        codigo_hash = bcrypt.generate_password_hash(codigo).decode('utf-8')
-
-        id_usuario = cuenta['id_usuario'] if tipo == 'usuario' else None
-        id_cliente = cuenta['id_cliente'] if tipo == 'cliente' else None
-
-        # Invalidar códigos anteriores de esta cuenta
-        cursor.execute("""
-            UPDATE recuperacion_contrasena SET usado = TRUE
-            WHERE COALESCE(id_usuario, -1) = COALESCE(%s, -1)
-              AND COALESCE(id_cliente, -1) = COALESCE(%s, -1)
-              AND usado = FALSE
-        """, (id_usuario, id_cliente))
-        cursor.execute("""
-            INSERT INTO recuperacion_contrasena
-                (id_usuario, id_cliente, codigo_hash, creado_en, expira_en, usado, ip_solicitud)
-            VALUES (%s, %s, %s, NOW(), NOW() + INTERVAL '10 minutes', FALSE, %s)
-        """, (id_usuario, id_cliente, codigo_hash, request.remote_addr))
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        app.logger.error(f"Error en recuperar_contrasena: {e}")
+    # Llamada HTTP a auth_service (anti-enumeración: siempre éxito genérico;
+    # el envío de correo y el guardado del OTP se ejecutan allí)
+    status, resp_json = _llamar_auth_service('post', '/recuperar_contrasena',
+                                             data={'correo': correo})
+    if status == 503:
         return render_template('recuperar_contrasena.html',
-                               error='No se pudo procesar la solicitud. Intenta de nuevo.')
-    finally:
-        conn.close()
+                               error=resp_json.get('error'))
+    if status != 200 or not resp_json.get('exito'):
+        return render_template('recuperar_contrasena.html',
+                               error=resp_json.get('error') or 'No se pudo procesar la solicitud. Intenta de nuevo.')
 
-    resultado = enviar_correo(
-        correo,
-        f'Tu código para recuperar tu contraseña CLEOFERR: {codigo}',
-        _correo_html_codigo(nombre, codigo, 'Tu código para restablecer tu contraseña es:'),
-        f"Hola {nombre},\n\nTu código para recuperar tu contraseña es: {codigo}\n\nVálido por 10 minutos."
-    )
-    if resultado == 'smtp_no_configurado':
+    if resp_json.get('codigo_visible'):
+        # SMTP no configurado: modo desarrollo, mostrar el código en pantalla
         return render_template('recuperar_contrasena.html',
                                verificar_activo=True, correo_verificar=correo,
-                               codigo_visible=codigo, aviso_smtp=True)
-    if resultado == 'smtp_auth':
-        return render_template('recuperar_contrasena.html',
-                               error='Error de autenticación con el correo. Contacta al administrador.')
-    if resultado:
-        return render_template('recuperar_contrasena.html',
-                               error='No se pudo enviar el correo. Intenta de nuevo.')
+                               codigo_visible=resp_json['codigo_visible'], aviso_smtp=True)
 
     return render_template('recuperar_contrasena.html',
                            verificar_activo=True, correo_verificar=correo)
@@ -2842,86 +2712,30 @@ def restablecer_contrasena():
     if len(nueva) < 6:
         return _reenviar_con_error('La contraseña debe tener al menos 6 caracteres.')
 
-    conn   = get_connection_auth()
-    cursor = conn.cursor(dictionary=True)
-    try:
-        tipo, cuenta = _buscar_cuenta_por_correo(cursor, correo)
-        if not cuenta:
-            return _reenviar_con_error('Solicitud no válida. Vuelve a solicitar el código.')
+    # Llamada HTTP a auth_service (validación OTP, expiración, intentos y
+    # cambio de contraseña en la tabla correspondiente se ejecutan allí)
+    status, resp_json = _llamar_auth_service('post', '/restablecer_contrasena',
+                                             data={'correo': correo,
+                                                   'codigo': codigo,
+                                                   'nueva': nueva,
+                                                   'confirmar': confirmar})
 
-        id_usuario = cuenta['id_usuario'] if tipo == 'usuario' else None
-        id_cliente = cuenta['id_cliente'] if tipo == 'cliente' else None
-
-        cursor.execute("""
-            SELECT id_recuperacion, codigo_hash, expira_en, intentos_fallidos
-            FROM recuperacion_contrasena
-            WHERE COALESCE(id_usuario, -1) = COALESCE(%s, -1)
-              AND COALESCE(id_cliente, -1) = COALESCE(%s, -1)
-              AND usado = FALSE
-            ORDER BY creado_en DESC LIMIT 1
-        """, (id_usuario, id_cliente))
-        rec = cursor.fetchone()
-
-        if not rec:
-            return _reenviar_con_error('No hay un código activo. Solicita uno nuevo.')
-
-        from datetime import datetime, timezone
-        if rec['expira_en'] < datetime.now(timezone.utc):
-            return _reenviar_con_error('El código expiró. Solicita uno nuevo.')
-
-        if rec['intentos_fallidos'] >= 5:
-            cursor.execute("UPDATE recuperacion_contrasena SET usado = TRUE WHERE id_recuperacion = %s",
-                           (rec['id_recuperacion'],))
-            conn.commit()
-            return render_template('recuperar_contrasena.html',
-                                   error='Demasiados intentos fallidos. Solicita un nuevo código.')
-
-        try:
-            coincide = bcrypt.check_password_hash(rec['codigo_hash'], codigo)
-        except (ValueError, TypeError):
-            coincide = False
-
-        if not coincide:
-            intentos = rec['intentos_fallidos'] + 1
-            cursor.execute("""
-                UPDATE recuperacion_contrasena
-                SET intentos_fallidos = %s, usado = (CASE WHEN %s >= 5 THEN TRUE ELSE usado END)
-                WHERE id_recuperacion = %s
-            """, (intentos, intentos, rec['id_recuperacion']))
-            conn.commit()
-            if intentos >= 5:
-                return render_template('recuperar_contrasena.html',
-                                       error='Demasiados intentos fallidos. Solicita un nuevo código.')
-            return _reenviar_con_error(f'Código incorrecto. Te quedan {5 - intentos} intentos.')
-
-        # Código correcto: cambiar contraseña y marcar código como usado
-        nuevo_hash = bcrypt.generate_password_hash(nueva).decode('utf-8')
-        if tipo == 'usuario':
-            cursor.execute("""
-                UPDATE usuario SET contrasena = %s, fecha_ultimo_cambio_pwd = NOW()
-                WHERE id_usuario = %s
-            """, (nuevo_hash, id_usuario))
-        else:
-            cursor.execute("""
-                UPDATE cliente SET contrasena = %s, fecha_ultimo_cambio_pwd = NOW()
-                WHERE id_cliente = %s
-            """, (nuevo_hash, id_cliente))
-        cursor.execute("UPDATE recuperacion_contrasena SET usado = TRUE WHERE id_recuperacion = %s",
-                       (rec['id_recuperacion'],))
-        conn.commit()
-
-        # Volver al login correspondiente
-        if tipo == 'usuario':
+    if status == 200 and resp_json.get('exito'):
+        # Volver al login correspondiente según el tipo de cuenta
+        if resp_json.get('tipo_cuenta') == 'usuario':
             return render_template('login.html',
-                                   success='Contraseña actualizada. Inicia sesión con tu nueva clave.')
+                                   success=resp_json.get('mensaje'))
         return render_template('login_cliente.html',
-                               success='Contraseña actualizada. Inicia sesión con tu nueva clave.')
-    except Exception as e:
-        conn.rollback()
-        app.logger.error(f"Error en restablecer_contrasena: {e}")
-        return _reenviar_con_error('Error al actualizar la contraseña. Intenta de nuevo.')
-    finally:
-        conn.close()
+                               success=resp_json.get('mensaje'))
+
+    if status in (400, 401, 404, 410, 503):
+        if status == 401 and resp_json.get('bloqueado'):
+            # Bloqueado: fuera de la pantalla de verificación, pedir código nuevo
+            return render_template('recuperar_contrasena.html',
+                                   error=resp_json.get('error'))
+        return _reenviar_con_error(resp_json.get('error') or 'Error. Intenta de nuevo.')
+
+    return _reenviar_con_error('Error al actualizar la contraseña. Intenta de nuevo.')
 
 
 @app.route('/mis_pedidos')
@@ -3193,4 +3007,4 @@ def _confirmar_carrito(items, metodo_pago='efectivo', tipo_comprobante='boleta_s
 
 if __name__ == '__main__':
     # debug solo si FLASK_DEBUG=1 explícitamente en el entorno (nunca en producción)
-    app.run(debug=os.environ.get("FLASK_DEBUG", "0") == "1")
+    app.run(host="127.0.0.1", port=5000, debug=False)

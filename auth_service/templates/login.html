@@ -161,10 +161,40 @@ function togglePw(inputId, iconId) {
     }
 }
 </script>
-</body>
-</html>
+<script>
+document.querySelector('form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const form = new FormData(e.target);
+  const correo = form.get('correo');
+  const clave = form.get('clave');
+
+  try {
+    const res = await fetch('http://127.0.0.1:5001/login', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'X-Requested-With': 'XMLHttpRequest'
+      },
+      credentials: 'include',
+      body: 'correo=' + encodeURIComponent(correo) + '&clave=' + encodeURIComponent(clave)
+    });
+
+    const data = await res.json();
+
+    if (res.ok && data.token) {
+      localStorage.setItem('jwt_token', data.token);
+      if (data.rol && ['administrador', 'vendedor'].includes(data.rol.toLowerCase())) {
+        window.location.href = 'http://127.0.0.1:5002/productos';
+      } else {
+        window.location.href = 'http://127.0.0.1:5002/catalogo';
+      }
+    } else {
+      alert('Error: ' + (data.error || 'Login fallido'));
     }
-}
+  } catch (err) {
+    alert('Error conexion: ' + err.message);
+  }
+});
 </script>
 </body>
 </html>

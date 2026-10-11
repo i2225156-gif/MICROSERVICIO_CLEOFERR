@@ -1,0 +1,561 @@
+{% extends 'base.html' %}
+{% block titulito %}Reportes – Cleoferr{% endblock %}
+{% block contenido %}
+
+<div class="page-header">
+    <div>
+        <h2><i class="fa fa-chart-line me-2"></i>REPORTES DE NEGOCIO</h2>
+        <p>Datos para el periodo <strong>{{ kpis.desde }}</strong> a <strong>{{ kpis.hasta }}</strong> ({{ kpis.dias }} días).</p>
+    </div>
+    <div class="d-flex gap-2">
+        <a href="/reportes/dia/exportar?desde={{ kpis.desde }}&hasta={{ kpis.hasta }}" class="btn btn-outline-secondary"><i class="fa fa-file-export me-1"></i>Exportar (hoy)</a>
+    </div>
+</div>
+
+{# ═══════════ RESUMEN DE HOY (fijo, no depende del filtro) ═══════════ #}
+<h4 class="fw-bold mt-0 mb-2"><i class="fa fa-sun me-2" style="color:#E8580A"></i>RESUMEN DE HOY</h4>
+<div class="card card-custom mb-3">
+    <div class="card-body py-2">
+        <div class="row text-center align-items-center">
+            <div class="col-md-4">
+                <span class="stat-label d-block">Ventas de hoy</span>
+                <span class="stat-value" style="font-size:1.4rem">{{ resumen.ventas_hoy or '0' }}</span>
+            </div>
+            <div class="col-md-4">
+                <span class="stat-label d-block">Productos en stock</span>
+                <span class="stat-value" style="font-size:1.4rem">{{ resumen.stock_total or '0' }}</span>
+            </div>
+            <div class="col-md-4">
+                <span class="stat-label d-block">Alertas pendientes</span>
+                <span class="stat-value" style="font-size:1.4rem">{{ resumen.alertas or '0' }}</span>
+            </div>
+        </div>
+    </div>
+</div>
+
+{# ═══════════ FILTRO DE PERIODO ═══════════ #}
+<div class="card card-custom mb-3">
+    <div class="card-header"><i class="fa fa-filter me-2"></i>¿Qué periodo quieres revisar?</div>
+    <div class="card-body">
+        <form method="GET" action="/reportes/generar" class="row g-3" id="formFiltro">
+            <input type="hidden" name="tipo" value="{{ tipo or 'ventas' }}">
+            <div class="col-md-4">
+                <label class="form-label fw-semibold">Periodo</label>
+                <select name="periodo" id="selPeriodo" class="form-select">
+                    <option value="semanal" {% if kpis.periodo == 'semanal' %}selected{% endif %}>Esta semana (últimos 7 días)</option>
+                    <option value="mensual" {% if kpis.periodo == 'mensual' %}selected{% endif %}>Este mes</option>
+                    <option value="anual" {% if kpis.periodo == 'anual' %}selected{% endif %}>Este año</option>
+                    <option value="personalizado" {% if kpis.periodo == 'personalizado' %}selected{% endif %}>Elegir mis propias fechas</option>
+                </select>
+            </div>
+            <div class="col-md-3">
+                <label class="form-label fw-semibold">Desde</label>
+                <input type="date" name="desde" id="inputDesde" class="form-control" value="{{ kpis.desde }}">
+            </div>
+            <div class="col-md-3">
+                <label class="form-label fw-semibold">Hasta</label>
+                <input type="date" name="hasta" id="inputHasta" class="form-control" value="{{ kpis.hasta }}">
+            </div>
+            <div class="col-md-2 d-flex align-items-end">
+                <button class="btn btn-naranja w-100"><i class="fa fa-rotate me-1"></i>Aplicar</button>
+            </div>
+        </form>
+        <script>
+        (function () {
+            const sel = document.getElementById('selPeriodo');
+            if (!sel) return;
+            sel.addEventListener('change', function () {
+                const hoy = new Date();
+                const iso = d => d.toISOString().slice(0, 10);
+                const d = document.getElementById('inputDesde');
+                const h = document.getElementById('inputHasta');
+                h.value = iso(hoy);
+                if (sel.value === 'semanal') {
+                    const d1 = new Date(hoy); d1.setDate(d1.getDate() - 6);
+                    d.value = iso(d1);
+                } else if (sel.value === 'mensual') {
+                    d.value = iso(new Date(hoy.getFullYear(), hoy.getMonth(), 1));
+                } else if (sel.value === 'anual') {
+                    d.value = iso(new Date(hoy.getFullYear(), 0, 1));
+                }
+                if (sel.value !== 'personalizado') {
+                    document.getElementById('formFiltro').submit();
+                }
+            });
+        })();
+        </script>
+    </div>
+</div>
+
+{# ── Macro de tarjeta KPI con textos sencillos ── #}
+{% macro kpi_card(icono, titulo, valor, delta, nota=None, ayuda=None, color='#E8580A', bg='#fdeee4') %}
+<div class="col-md-3">
+    <div class="card card-custom stat-card h-100">
+        <div class="d-flex align-items-center gap-3">
+            <div class="stat-icon" style="background:{{ bg }};color:{{ color }}"><i class="fa {{ icono }}"></i></div>
+            <div>
+                <div class="stat-value">{{ valor }}</div>
+                <div class="stat-label">
+                    {{ titulo }}
+                    {% if ayuda %}
+                    <i class="fa fa-circle-question" style="color:#999;font-size:.8rem" title="{{ ayuda }}"></i>
+                    {% endif %}
+                </div>
+                {% if nota %}<div style="font-size:.78rem;color:#888">{{ nota }}</div>{% endif %}
+                {% if delta is not none %}
+                <div style="font-size:.78rem;font-weight:600"
+                     class="{{ 'text-success' if delta >= 0 else 'text-danger' }}">
+                    <i class="fa {{ 'fa-arrow-up' if delta >= 0 else 'fa-arrow-down' }}"></i>
+                    {{ '%.1f'|format(delta|abs) }}% vs periodo anterior
+                </div>
+                {% else %}
+                <div style="font-size:.78rem;color:#888">Aún no hay suficiente historial para comparar</div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+{% endmacro %}
+
+{# ═══════════ VENTAS ═══════════ #}
+<h4 class="fw-bold mt-3 mb-2"><i class="fa fa-money-bill-wave me-2" style="color:#E8580A"></i>VENTAS</h4>
+<div class="card card-custom mb-3">
+    <div class="card-body">
+        <div class="row g-3 mb-3">
+            {{ kpi_card('fa-money-bill-wave', 'Ventas totales', 'S/ %.2f'|format(kpis.ventas), kpis.ventas_delta,
+                        nota='Todo lo vendido en el periodo') }}
+            {{ kpi_card('fa-sack-dollar', 'Ganancia (margen)', 'S/ %.2f (%.1f%% sobre la venta)'|format(kpis.margen, kpis.margen_pct), kpis.margen_delta,
+                        nota='Cuánto te quedó después de restar lo que te costó la mercadería. Calculado sobre productos con costo registrado (%.0f%% de las ventas).'|format(kpis.margen_cobertura)) }}
+            {{ kpi_card('fa-receipt', 'Venta promedio por cliente', 'S/ %.2f'|format(kpis.ticket), kpis.ticket_delta,
+                        color='#2770b8', bg='#e8f0fb',
+                        nota='Lo que gasta un cliente en promedio por compra') }}
+            {% set nbajo = (kpis.inv_dona | selectattr('estado','equalto','Sin stock') | first).n if kpis.inv_dona else 0 %}
+            {% set ncrit = nbajo + ((kpis.inv_dona | selectattr('estado','equalto','Stock bajo') | first).n if kpis.inv_dona) %}
+            {{ kpi_card('fa-triangle-exclamation', 'Productos con poco o nada de stock', ncrit, None,
+                        color='#dc3545', bg='#fdecea',
+                        nota='Revisa y repón cuanto antes',
+                        ayuda='Cuenta los productos agotados o por debajo del mínimo recomendado.') }}
+        </div>
+        <div class="row g-3">
+            <div class="col-md-6">
+                <h6 class="fw-semibold mb-1">Ventas por día
+                    <i class="fa fa-circle-question" style="color:#999;font-size:.75rem"
+                       title="Cuánto vendiste cada día del periodo. El punto más alto es tu mejor día."></i>
+                </h6>
+                {% set serie = kpis.ventas_serie %}
+                {% if serie %}
+                {% set vmax = (serie | map(attribute='total') | max) or 1 %}
+                <svg viewBox="0 0 400 170" width="100%" height="170" role="img" aria-label="Ventas por día en soles">
+                    <!-- eje Y: montos -->
+                    {% for fr in [0, 0.5, 1] %}
+                    {% set yy = 130 - fr * 110 %}
+                    <line x1="45" y1="{{ yy }}" x2="395" y2="{{ yy }}" stroke="#eee"/>
+                    <text x="0" y="{{ yy + 4 }}" font-size="9" fill="#999">S/ {{ '%.0f'|format(vmax * fr) }}</text>
+                    {% endfor %}
+                    <line x1="45" y1="130" x2="395" y2="130" stroke="#dee2e6"/>
+                    <polyline fill="none" stroke="#E8580A" stroke-width="2"
+                        points="{% for p in serie %}{{ (45 + loop.index0 * (350 / (serie|length if serie|length > 1 else 1)))|round(1) }},{{ 130 - (p.total / vmax * 110)|round(1) }}{{ ' ' if not loop.last }}{% endfor %}"/>
+                    {% for p in serie %}
+                    <circle cx="{{ (45 + loop.index0 * (350 / (serie|length if serie|length > 1 else 1)))|round(1) }}"
+                            cy="{{ 130 - (p.total / vmax * 110)|round(1) }}" r="3" fill="#E8580A">
+                        <title>{{ p.dia }}: S/ {{ '%.2f'|format(p.total) }}</title>
+                    </circle>
+                    <!-- eje X: fechas (primera, medio, ultima) -->
+                    {% if loop.index in (1, serie|length // 2 + 1, serie|length) %}
+                    <text x="{{ (45 + loop.index0 * (350 / (serie|length if serie|length > 1 else 1)))|round(1) }}"
+                          y="148" font-size="8" fill="#666" text-anchor="middle">{{ p.dia[5:] }}</text>
+                    {% endif %}
+                    {% endfor %}
+                </svg>
+                <div style="font-size:.8rem;color:#666"><span style="color:#E8580A">&#9679;</span> Venta diaria en soles</div>
+                {% else %}
+                <p class="text-muted mb-0">Sin ventas en este periodo.</p>
+                {% endif %}
+            </div>
+            <div class="col-md-6">
+                <h6 class="fw-semibold mb-2">Qué categorías se venden más</h6>
+                {% set cats = kpis.ventas_cat %}
+                {% if cats %}
+                {% set cmax = (cats | map(attribute='total') | max) or 1 %}
+                <svg viewBox="0 0 400 {{ 24 * cats|length }}" width="100%" role="img" aria-label="Ventas por categoría">
+                    {% for c in cats %}
+                    {% set w = (c.total / cmax * 160)|round(1) %}
+                    <text x="0" y="{{ loop.index0 * 24 + 14 }}" font-size="11" fill="#333">{{ c.categoria }}</text>
+                    <rect x="140" y="{{ loop.index0 * 24 + 4 }}" width="{{ w }}" height="14" rx="3" fill="#E8580A"/>
+                    <text x="395" y="{{ loop.index0 * 24 + 15 }}" font-size="11" fill="#333" text-anchor="end">S/ {{ '%.2f'|format(c.total) }}</text>
+                    {% endfor %}
+                </svg>
+                {% else %}
+                <p class="text-muted mb-0">Sin ventas por categoría en este periodo.</p>
+                {% endif %}
+            </div>
+        </div>
+        <div class="row g-3">
+            <div class="col-md-6">
+                <h6 class="fw-semibold mb-2">Margen por categoría</h6>
+                {% set mcats = kpis.margen_cat %}
+                {% if mcats %}
+                {% set mmax = (mcats | map(attribute='margen') | max) or 1 %}
+                <svg viewBox="0 0 400 {{ 24 * mcats|length }}" width="100%" role="img" aria-label="Margen por categoría">
+                    {% for c in mcats %}
+                    {% set w = (c.margen / mmax * 160)|round(1) %}
+                    <text x="0" y="{{ loop.index0 * 24 + 14 }}" font-size="11" fill="#333">{{ c.categoria }}</text>
+                    <rect x="140" y="{{ loop.index0 * 24 + 4 }}" width="{{ w }}" height="14" rx="3" fill="#2770b8"/>
+                    <text x="395" y="{{ loop.index0 * 24 + 15 }}" font-size="11" fill="#333" text-anchor="end">S/ {{ '%.2f'|format(c.margen) }}</text>
+                    {% endfor %}
+                </svg>
+                {% else %}
+                <p class="text-muted mb-0">Sin margen calculable en el periodo.</p>
+                {% endif %}
+            </div>
+            <div class="col-md-6">
+                <h6 class="fw-semibold mb-2">Qué te deja más ganancia (y cuál menos)</h6>
+                {% if kpis.top_margen_max %}
+                <ul class="list-group list-group-flush">
+                    {% for p in kpis.top_margen_max %}
+                    <li class="list-group-item d-flex justify-content-between px-0 py-1">
+                        <span>{{ p.nombre }}</span>
+                        <strong class="text-success">S/ {{ '%.2f'|format(p.margen) }}</strong>
+                    </li>
+                    {% endfor %}
+                </ul>
+                {% else %}<p class="text-muted mb-0">Sin datos.</p>{% endif %}
+                {% if kpis.top_margen_min %}
+                <h6 class="fw-semibold mb-2 mt-2">Los que menos te dejan</h6>
+                <ul class="list-group list-group-flush">
+                    {% for p in kpis.top_margen_min %}
+                    <li class="list-group-item d-flex justify-content-between px-0 py-1">
+                        <span>{{ p.nombre }}</span>
+                        <strong class="text-danger">S/ {{ '%.2f'|format(p.margen) }}</strong>
+                    </li>
+                    {% endfor %}
+                </ul>
+                {% endif %}
+            </div>
+        </div>
+        <hr class="my-3">
+        <h6 class="fw-bold mb-1" style="font-size:.95rem"><i class="fa fa-shop me-1" style="color:#6f42c1"></i>VENTAS ONLINE VS. TIENDA FÍSICA
+            <i class="fa fa-circle-question" style="color:#999;font-size:.75rem"
+               title="Te muestra cuánto vendes por la tienda web (online) y cuánto en tu tienda física (mostrador), para saber dónde te conviene invertir más."></i>
+        </h6>
+        <p class="text-muted mb-2" style="font-size:.85rem">
+            Te ayuda a decidir si le metes más a la publicidad online o a mejorar tu tienda, según cuál canal te deja más plata o clientes con compras más grandes.
+        </p>
+        {% set on = kpis.canal.online %}{% set lo = kpis.canal.local %}
+        <div class="row g-3 mb-2">
+            {{ kpi_card('fa-globe', 'Ventas online (web)', 'S/ %.2f'|format(on.monto), None,
+                        nota='%.1f%% del total del periodo'|format(on.pct), color='#6f42c1', bg='#efe9fb') }}
+            {{ kpi_card('fa-store', 'Ventas en tienda física (mostrador)', 'S/ %.2f'|format(lo.monto), None,
+                        nota='%.1f%% del total del periodo'|format(lo.pct), color='#E8580A', bg='#fdeee4') }}
+            {{ kpi_card('fa-scale-balanced', 'Compra promedio por canal', 'Web: S/ %.2f  |  Tienda: S/ %.2f'|format(on.ticket, lo.ticket), None,
+                        nota='Para ver en qué canal tus clientes gastan más por visita',
+                        color='#28a745', bg='#e6f4ea') }}
+        </div>
+        <div class="row g-3">
+            <div class="col-md-5 d-flex align-items-center gap-3">
+                {% set total_canal = on.monto + lo.monto %}
+                {% if total_canal > 0 %}
+                {% set pct_on = (on.monto / total_canal * 100)|round(2) %}
+                <svg viewBox="0 0 42 42" width="130" height="130" role="img" aria-label="Ventas online vs locales">
+                    <circle cx="21" cy="21" r="15.915" fill="none" stroke="#E8580A" stroke-width="6"/>
+                    <circle cx="21" cy="21" r="15.915" fill="none" stroke="#6f42c1" stroke-width="6"
+                            stroke-dasharray="{{ pct_on }} {{ 100 - pct_on }}" stroke-dashoffset="25">
+                        <title>Online: {{ pct_on }}%</title>
+                    </circle>
+                </svg>
+                <div style="font-size:.85rem">
+                    <div><span style="color:#6f42c1">&#9679;</span> Online: <strong>{{ '%.1f'|format(on.pct) }}%</strong></div>
+                    <div><span style="color:#E8580A">&#9679;</span> Tienda: <strong>{{ '%.1f'|format(lo.pct) }}%</strong></div>
+                </div>
+                {% else %}
+                <p class="text-muted mb-0">Sin ventas en este periodo.</p>
+                {% endif %}
+            </div>
+            <div class="col-md-7">
+                <h6 class="fw-semibold mb-2">Día a día</h6>
+                {% if kpis.canal_dia %}
+                <div class="table-responsive" style="max-height:220px;overflow-y:auto">
+                    <table class="table table-sm table-custom mb-0">
+                        <thead><tr><th>Fecha</th><th class="text-end">Online</th><th class="text-end">Tienda física</th><th class="text-end">% online</th><th class="text-end">% tienda</th></tr></thead>
+                        <tbody>
+                            {% for d in kpis.canal_dia %}
+                            {% set ttd = d.online + d.local %}
+                            <tr>
+                                <td>{{ d.dia }}</td>
+                                <td class="text-end">S/ {{ '%.2f'|format(d.online) }}</td>
+                                <td class="text-end">S/ {{ '%.2f'|format(d.local) }}</td>
+                                <td class="text-end">{{ '%.1f'|format(d.online / ttd * 100 if ttd else 0) }}%</td>
+                                <td class="text-end">{{ '%.1f'|format(d.local / ttd * 100 if ttd else 0) }}%</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% else %}
+                <p class="text-muted mb-0">Sin ventas en este periodo.</p>
+                {% endif %}
+            </div>
+        </div>
+        <div class="row g-3 mt-1">
+            <div class="col-12">
+                <h6 class="fw-semibold mb-2">Productos que más se venden</h6>
+                {% if kpis.top_productos %}
+                <div class="table-responsive">
+                    <table class="table table-sm table-custom table-hover mb-0">
+                        <thead><tr><th>#</th><th>Producto</th><th class="text-end">Unidades vendidas</th><th class="text-end">Plata que entró por él</th></tr></thead>
+                        <tbody>
+                            {% for p in kpis.top_productos %}
+                            <tr><td>{{ loop.index }}</td><td>{{ p.nombre }}</td><td class="text-end">{{ p.unidades }}</td><td class="text-end">S/ {{ '%.2f'|format(p.ingreso) }}</td></tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% else %}
+                <p class="text-muted mb-0">Sin ventas en este periodo.</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+
+{# ═══════════ INVENTARIO ═══════════ #}
+<h4 class="fw-bold mt-3 mb-2"><i class="fa fa-boxes-stacked me-2" style="color:#2770b8"></i>INVENTARIO</h4>
+<div class="card card-custom mb-3">
+    <div class="card-body">
+        <div class="row g-3 mb-3">
+            <div class="col-md-4">
+                <div class="card card-custom stat-card h-100">
+                    <div class="d-flex align-items-center gap-3">
+                        <div class="stat-icon" style="background:#fdeee4;color:#E8580A"><i class="fa fa-gauge-high"></i></div>
+                        <div>
+                            {% if kpis.dias_stock is not none %}
+                            <div class="stat-value">{{ kpis.dias_stock }} días</div>
+                            {% else %}
+                            <div class="stat-value text-muted" style="font-size:1.2rem">Sin ventas en el periodo</div>
+                            {% endif %}
+                            <div class="stat-label">
+                                Días en que agotarías tu stock actual
+                                <i class="fa fa-circle-question" style="color:#999;font-size:.8rem"
+                                   title="Cada cuánto se renueva tu inventario: al ritmo de venta actual, en cuántos días venderías todo lo que tienes hoy. Menos días = stock que vuela; más días = stock parado."></i>
+                            </div>
+                            <div style="font-size:.78rem;color:#888">A este ritmo de ventas, eso es lo que te duraría lo que tienes</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="card card-custom stat-card h-100">
+                    <div class="d-flex align-items-center gap-3">
+                        <div class="stat-icon" style="background:#fdecea;color:#dc3545"><i class="fa fa-triangle-exclamation"></i></div>
+                        <div>
+                            <div class="stat-value">{{ (kpis.inv_dona | selectattr('estado','equalto','Sin stock') | first).n if kpis.inv_dona else 0 }}</div>
+                            <div class="stat-label">Productos agotados</div>
+                            <div style="font-size:.78rem;color:#888">Sin una sola unidad para vender</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="card card-custom stat-card h-100">
+                    <div class="d-flex align-items-center gap-3">
+                        <div class="stat-icon" style="background:#e8f0fb;color:#2770b8"><i class="fa fa-boxes-stacked"></i></div>
+                        <div>
+                            <div class="stat-value">{{ resumen.stock_total or '0' }}</div>
+                            <div class="stat-label">Unidades totales en stock</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="row g-3">
+            <div class="col-md-6">
+                <h6 class="fw-semibold mb-2">Cómo está tu stock
+                    <i class="fa fa-circle-question" style="color:#999;font-size:.75rem"
+                       title="Verde = suficiente, amarillo = por agotarse, rojo = agotado."></i>
+                </h6>
+                {% set total_inv = kpis.inv_dona | map(attribute='n') | sum %}
+                {% if total_inv %}
+                {% set ns = namespace(offset=25.0) %}
+                <div class="d-flex align-items-center gap-4">
+                    <svg viewBox="0 0 42 42" width="130" height="130" role="img" aria-label="Estado del inventario">
+                        <circle cx="21" cy="21" r="15.915" fill="none" stroke="#eee" stroke-width="6"/>
+                        {% set colores = {'Sin stock': '#dc3545', 'Stock bajo': '#ffc107', 'Stock OK': '#28a745'} %}
+                        {% for s in kpis.inv_dona if s.n > 0 %}
+                        {% set pct = (s.n / total_inv * 100)|round(2) %}
+                        <circle cx="21" cy="21" r="15.915" fill="none"
+                                stroke="{{ colores[s.estado] }}" stroke-width="6"
+                                stroke-dasharray="{{ pct }} {{ 100 - pct }}"
+                                stroke-dashoffset="{{ (-ns.offset)|round(2) }}">
+                            <title>{{ s.estado }}: {{ s.n }}</title>
+                        </circle>
+                        {% set ns.offset = ns.offset + pct %}
+                        {% endfor %}
+                    </svg>
+                    <div style="font-size:.85rem">
+                        <div><span style="color:#28a745">&#9679;</span> Stock bien: <strong>{{ (kpis.inv_dona | selectattr('estado','equalto','Stock OK') | first).n if kpis.inv_dona else 0 }}</strong></div>
+                        <div><span style="color:#ffc107">&#9679;</span> Por agotarse: <strong>{{ (kpis.inv_dona | selectattr('estado','equalto','Stock bajo') | first).n if kpis.inv_dona else 0 }}</strong></div>
+                        <div><span style="color:#dc3545">&#9679;</span> Agotado: <strong>{{ (kpis.inv_dona | selectattr('estado','equalto','Sin stock') | first).n if kpis.inv_dona else 0 }}</strong></div>
+                    </div>
+                </div>
+                {% else %}
+                <p class="text-muted mb-0">Aún no tienes productos registrados.</p>
+                {% endif %}
+            </div>
+            <div class="col-md-6 mb-3 border-start border-2 ps-4">
+                <h6 class="fw-semibold mb-2">Te conviene revisar</h6>
+                <p class="text-muted mb-0"><em>Luego agregamos: lista de productos que casi no se venden (stock parado) y el valor total en soles de tu inventario.</em></p>
+            </div>
+        </div>
+    </div>
+</div>
+
+{# ═══════════ CLIENTES Y REGISTROS ═══════════ #}
+<h4 class="fw-bold mt-3 mb-2"><i class="fa fa-users me-2" style="color:#6f42c1"></i>CLIENTES Y REGISTROS</h4>
+{% set vf = kpis.verificacion %}
+<div class="card card-custom mb-3">
+    <div class="card-body">
+        <p class="text-muted mb-3" style="font-size:.85rem">
+            Aquí ves cuántos clientes que pidieron un código para registrarse en la tienda online
+            completaron su registro, y cuántos se quedaron en el camino. Si muchos no terminan,
+            puede que el código les llegue tarde, se pierda, o se confundan al ingresarlo.
+        </p>
+        <div class="row g-3 mb-3">
+            {{ kpi_card('fa-user-check', 'Clientes que completaron su registro', '%.1f%%'|format(vf.tasa_global), None,
+                        color='#28a745', bg='#e6f4ea',
+                        nota='Del total de códigos enviados en el periodo',
+                        ayuda='De cada 100 códigos enviados, cuántos usaron el cliente para activar su cuenta.') }}
+            {{ kpi_card('fa-envelope', 'Códigos enviados en el periodo', vf.total_codigos, None,
+                        color='#2770b8', bg='#e8f0fb') }}
+            {{ kpi_card('fa-user-xmark', 'Clientes que no terminaron de registrarse', vf.sin_usar, None,
+                        color='#dc3545', bg='#fdecea',
+                        nota='Recibieron código pero nunca lo usaron') }}
+        </div>
+
+        {% if vf.por_dia %}
+        <div class="row g-3">
+            <div class="col-md-7">
+                <h6 class="fw-semibold mb-1">Registro por día
+                    <i class="fa fa-circle-question" style="color:#999;font-size:.75rem"
+                       title="Cada barra es un día. La parte verde es el % de clientes que completó su registro; la roja, quienes no."></i>
+                </h6>
+                {% set ndias = vf.por_dia|length %}
+                {% set bw = (360 / ndias * 0.6)|round(1) %}
+                <svg viewBox="0 0 400 175" width="100%" height="175" role="img" aria-label="Porcentaje de registro por día">
+                    {% for yv, lbl in [(130,'0'),(75,'50'),(20,'100')] %}
+                    <line x1="30" y1="{{ yv }}" x2="395" y2="{{ yv }}" stroke="#eee"/>
+                    <text x="2" y="{{ yv + 4 }}" font-size="9" fill="#999">{{ lbl }}%</text>
+                    {% endfor %}
+                    {% for d in vf.por_dia %}
+                    {% set x = (30 + loop.index0 * (365 / ndias) + (365/ndias - bw)/2)|round(1) %}
+                    {% set h_g = (d.t_pct * 110 / 100)|round(1) %}
+                    {% set h_r = (d.f_pct * 110 / 100)|round(1) %}
+                    <rect x="{{ x }}" y="{{ 130 - h_g }}" width="{{ bw }}" height="{{ h_g }}" fill="#28a745">
+                        <title>{{ d.dia }}: {{ d.t_pct }}% completaron ({{ d.t_n }} de {{ d.total }})</title>
+                    </rect>
+                    <rect x="{{ x }}" y="{{ 130 - h_g - h_r }}" width="{{ bw }}" height="{{ h_r }}" fill="#dc3545">
+                        <title>{{ d.dia }}: {{ d.f_pct }}% sin terminar ({{ d.f_n }} de {{ d.total }})</title>
+                    </rect>
+                    <text x="{{ (x + bw/2)|round(1) }}" y="148" font-size="8" fill="#666"
+                          text-anchor="middle" transform="rotate(-30 {{ (x + bw/2)|round(1) }} 148)">{{ d.dia[5:] }}</text>
+                    {% endfor %}
+                </svg>
+                <div style="font-size:.85rem;margin-top:4px">
+                    <span style="color:#28a745">&#9632;</span> <strong>% completaron su registro</strong> &nbsp;
+                    <span style="color:#dc3545">&#9632;</span> <strong>% no lo terminaron</strong>
+                </div>
+            </div>
+            <div class="col-md-5">
+                <h6 class="fw-semibold mb-2">Detalle por día</h6>
+                <div class="table-responsive" style="max-height:220px;overflow-y:auto">
+                    <table class="table table-sm table-custom mb-0">
+                        <thead>
+                            <tr><th>Fecha</th><th>Total códigos</th><th>Completaron</th><th>%</th><th>No terminaron</th><th>%</th></tr>
+                        </thead>
+                        <tbody>
+                            {% for d in vf.por_dia %}
+                            <tr>
+                                <td>{{ d.dia }}</td><td>{{ d.total }}</td>
+                                <td class="text-success fw-semibold">{{ d.t_n }}</td>
+                                <td>{{ '%.1f'|format(d.t_pct) }}%</td>
+                                <td class="text-danger fw-semibold">{{ d.f_n }}</td>
+                                <td>{{ '%.1f'|format(d.f_pct) }}%</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        {% else %}
+        <p class="text-muted mb-0">Nadie pidió un código de registro en este periodo.</p>
+        {% endif %}
+    </div>
+</div>
+
+{# ═══════════ Generar reporte + exportaciones ═══════════ #}
+<h4 class="fw-bold mt-3 mb-2"><i class="fa fa-file-export me-2" style="color:#6c757d"></i>EXPORTAR REPORTES</h4>
+<div class="card card-custom mb-3">
+    <div class="card-header"><i class="fa fa-table me-2"></i>Ver detalle en tabla o descargarlo en Excel</div>
+    <div class="card-body">
+        <form method="GET" action="/reportes/generar" class="row g-3">
+            <input type="hidden" name="periodo" value="{{ kpis.periodo }}">
+            <input type="hidden" name="desde" value="{{ kpis.desde }}">
+            <input type="hidden" name="hasta" value="{{ kpis.hasta }}">
+            <div class="col-md-4">
+                <label class="form-label fw-semibold">¿Qué quieres ver?</label>
+                <select name="tipo" class="form-select">
+                    {% for val, etq in [("ventas","Ventas"),("productos","Productos"),
+                                        ("inventario","Inventario"),("pedidos","Pedidos"),
+                                        ("clientes","Clientes"),("proveedores","Proveedores")] %}
+                    <option value="{{ val }}" {% if tipo == val %}selected{% endif %}>{{ etq }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="col-md-8 d-flex align-items-end gap-2">
+                <button class="btn btn-naranja"><i class="fa fa-chart-line me-1"></i>Ver en tabla</button>
+                <a href="/reportes/{{ tipo or 'pedidos' }}/exportar?desde={{ kpis.desde }}&hasta={{ kpis.hasta }}" class="btn btn-outline-success"><i class="fa fa-file-excel me-1"></i>Descargar (.xlsx)</a>
+            </div>
+        </form>
+    </div>
+</div>
+
+<div class="card card-custom mb-3">
+    <div class="card-header"><i class="fa fa-download me-2"></i>Descargas rápidas</div>
+    <div class="card-body d-flex flex-wrap gap-2">
+        {% for tipo, etq in [("pedidos","Pedidos"),("productos","Productos"),
+                             ("inventario","Inventario"),("clientes","Clientes"),
+                             ("proveedores","Proveedores"),("dia","Ventas de hoy")] %}
+        <a href="/reportes/{{ tipo }}/exportar?desde={{ kpis.desde }}&hasta={{ kpis.hasta }}" class="btn btn-outline-secondary btn-sm"><i class="fa fa-file-excel me-1"></i>{{ etq }}</a>
+        {% endfor %}
+    </div>
+</div>
+
+{% if reportes %}
+<div class="card card-custom mt-3">
+    <div class="card-header"><i class="fa fa-table me-2"></i>Detalle del reporte</div>
+    <div class="card-body p-0">
+        <div class="table-responsive">
+            <table class="table table-custom table-hover mb-0">
+                <thead>
+                    <tr>
+                        {% for h in reportes.headers %}
+                        <th>{{ h }}</th>
+                        {% endfor %}
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in reportes.rows %}
+                    <tr>
+                        {% for cell in row %}
+                        <td>{{ cell }}</td>
+                        {% endfor %}
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+{% endblock %}

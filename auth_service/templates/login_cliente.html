@@ -145,6 +145,7 @@
             </div>
             <form method="POST" action="/verificar_registro">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="hidden" name="correo" value="{{ correo_verificar }}">
                 <div class="mb-4">
                     <label class="form-label text-center d-block">Ingresa el código</label>
                     <input type="text" name="codigo" class="code-input"

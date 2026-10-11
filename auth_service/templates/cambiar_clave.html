@@ -7,7 +7,7 @@
         <h2><i class="fa fa-key me-2"></i>Cambiar Contraseña</h2>
     </div>
     {% if session.rol == 'cliente' %}<a href="http://127.0.0.1:5002/catalogo" class="btn btn-outline-light"><i class="fa fa-arrow-left me-1"></i>Volver</a>
-{% else %}<a href="http://127.0.0.1:5002/productos" class="btn btn-outline-light"><i class="fa fa-arrow-left me-1"></i>Volver{% endif %}
+{% else %}<a href="http://127.0.0.1:5002/productos" class="btn btn-outline-light"><i class="fa fa-arrow-left me-1"></i>Volver</a>{% endif %}
 </div>
 
 <div class="card card-custom" style="max-width:450px">
@@ -15,8 +15,22 @@
         {% if error %}
             <div class="alert alert-danger"><i class="fa fa-exclamation-circle me-2"></i>{{ error }}</div>
         {% endif %}
+        {% if mensaje %}
+            <div class="alert alert-success"><i class="fa fa-check-circle me-2"></i>{{ mensaje }}</div>
+        {% endif %}
         <form method="POST">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <div class="mb-3">
+                <label class="form-label fw-semibold">Contraseña actual</label>
+                <div style="position:relative">
+                    <input type="password" name="clave_actual" id="campoPw0"
+                           class="form-control pe-5" required placeholder="Tu contraseña actual">
+                    <button type="button" onclick="togglePw('campoPw0','icon0')"
+                            style="position:absolute;right:0;top:0;height:100%;background:transparent;border:none;padding:0 14px;color:#aaa;cursor:pointer">
+                        <i class="fa fa-eye" id="icon0"></i>
+                    </button>
+                </div>
+            </div>
             <div class="mb-3">
                 <label class="form-label fw-semibold">Nueva contraseña</label>
                 <div style="position:relative">
